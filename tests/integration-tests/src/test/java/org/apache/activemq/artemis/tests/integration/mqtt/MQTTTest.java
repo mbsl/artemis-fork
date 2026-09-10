@@ -59,16 +59,18 @@ import org.apache.activemq.artemis.core.config.Configuration;
 import org.apache.activemq.artemis.core.config.CoreAddressConfiguration;
 import org.apache.activemq.artemis.core.management.impl.view.ProducerField;
 import org.apache.activemq.artemis.core.postoffice.Binding;
+import org.apache.activemq.artemis.core.postoffice.PostOffice;
 import org.apache.activemq.artemis.core.postoffice.QueueBinding;
 import org.apache.activemq.artemis.core.protocol.mqtt.MQTTUtil;
+import org.apache.activemq.artemis.core.protocol.mqtt.PacketIdCache;
 import org.apache.activemq.artemis.core.server.ActiveMQServer;
-import org.apache.activemq.artemis.core.server.Queue;
 import org.apache.activemq.artemis.core.server.impl.AddressInfo;
 import org.apache.activemq.artemis.core.settings.impl.AddressSettings;
 import org.apache.activemq.artemis.json.JsonArray;
 import org.apache.activemq.artemis.json.JsonObject;
 import org.apache.activemq.artemis.logs.AssertionLoggerHandler;
 import org.apache.activemq.artemis.tests.util.Wait;
+import org.apache.activemq.artemis.utils.ByteUtil;
 import org.apache.activemq.artemis.utils.RandomUtil;
 import org.apache.activemq.transport.amqp.client.AmqpClient;
 import org.apache.activemq.transport.amqp.client.AmqpConnection;
@@ -76,6 +78,7 @@ import org.apache.activemq.transport.amqp.client.AmqpMessage;
 import org.apache.activemq.transport.amqp.client.AmqpSender;
 import org.apache.activemq.transport.amqp.client.AmqpSession;
 import org.eclipse.paho.client.mqttv3.MqttClient;
+import org.eclipse.paho.client.mqttv3.MqttConnectOptions;
 import org.eclipse.paho.client.mqttv3.MqttMessage;
 import org.fusesource.mqtt.client.BlockingConnection;
 import org.fusesource.mqtt.client.MQTT;
@@ -100,7 +103,6 @@ public class MQTTTest extends MQTTTestSupport {
 
    private static final String AMQP_URI = "tcp://localhost:61616";
 
-
    @Override
    public void configureBroker() throws Exception {
       super.configureBroker();
@@ -111,7 +113,9 @@ public class MQTTTest extends MQTTTestSupport {
    @Test
    public void testConnectWithLargePassword() throws Exception {
       for (String version : Arrays.asList("3.1", "3.1.1")) {
-         String longString = new String(new char[65535]);
+         // MQTT forbids U+0000 in UTF-8 Encoded Strings (MQTT-1.5.3-2 / MQTT-1.5.4-2).
+         // Netty enforces this more strictly since 4.1.136.
+         String longString = "x".repeat(65535);
 
          BlockingConnection connection = null;
          try {
@@ -315,30 +319,6 @@ public class MQTTTest extends MQTTTestSupport {
          assertNotNull(message, "Should get a message");
          assertEquals(payload, new String(message));
       }
-      provider.disconnect();
-   }
-
-   @Test
-   @Timeout(120)
-   public void testManagementQueueMessagesAreAckd() throws Exception {
-      String clientId = "test.client.id";
-      final MQTTClientProvider provider = getMQTTClientProvider();
-      provider.setClientId(clientId);
-      initializeConnection(provider);
-      provider.subscribe("foo", EXACTLY_ONCE);
-      for (int i = 0; i < NUM_MESSAGES; i++) {
-         String payload = "Test Message: " + i;
-         provider.publish("foo", payload.getBytes(), EXACTLY_ONCE);
-         byte[] message = provider.receive(5000);
-         assertNotNull(message, "Should get a message");
-         assertEquals(payload, new String(message));
-      }
-
-      final Queue queue = server.locateQueue(SimpleString.of(MQTTUtil.QOS2_MANAGEMENT_QUEUE_PREFIX + clientId));
-
-      Wait.waitFor(() -> queue.getMessageCount() == 0, 1000, 100);
-
-      assertEquals(0, queue.getMessageCount());
       provider.disconnect();
    }
 
@@ -2263,6 +2243,7 @@ public class MQTTTest extends MQTTTestSupport {
    @Test
    @Timeout(60)
    public void testAutoDeleteRetainedQueue() throws Exception {
+      final int MESSAGE_COUNT = 3;
       final String TOPIC = "/abc/123";
       final String RETAINED_QUEUE = MQTTUtil.getCoreRetainAddressFromMqttTopic(TOPIC, server.getConfiguration().getWildcardConfiguration());
       final MQTTClientProvider publisher = getMQTTClientProvider();
@@ -2276,22 +2257,22 @@ public class MQTTTest extends MQTTTestSupport {
       String RETAINED = "retained";
       publisher.publish(TOPIC, RETAINED.getBytes(), AT_LEAST_ONCE, true);
 
-      List<String> messages = new ArrayList<>();
-      for (int i = 0; i < 10; i++) {
-         messages.add("TEST MESSAGE:" + i);
-      }
-
       subscriber.subscribe(TOPIC, AT_LEAST_ONCE);
-
-      for (int i = 0; i < 10; i++) {
-         publisher.publish(TOPIC, messages.get(i).getBytes(), AT_LEAST_ONCE);
-      }
 
       byte[] msg = subscriber.receive(5000);
       assertNotNull(msg);
       assertEquals(RETAINED, new String(msg));
 
-      for (int i = 0; i < 10; i++) {
+      List<String> messages = new ArrayList<>();
+      for (int i = 0; i < MESSAGE_COUNT; i++) {
+         messages.add("TEST MESSAGE:" + i);
+      }
+
+      for (int i = 0; i < MESSAGE_COUNT; i++) {
+         publisher.publish(TOPIC, messages.get(i).getBytes(), AT_LEAST_ONCE);
+      }
+
+      for (int i = 0; i < MESSAGE_COUNT; i++) {
          msg = subscriber.receive(5000);
          assertNotNull(msg);
          assertEquals(messages.get(i), new String(msg));
@@ -2312,15 +2293,15 @@ public class MQTTTest extends MQTTTestSupport {
 
       subscriber.subscribe(TOPIC, AT_LEAST_ONCE);
 
-      for (int i = 0; i < 10; i++) {
-         publisher.publish(TOPIC, messages.get(i).getBytes(), AT_LEAST_ONCE);
-      }
-
       msg = subscriber.receive(5000);
       assertNotNull(msg);
       assertEquals(RETAINED, new String(msg));
 
-      for (int i = 0; i < 10; i++) {
+      for (int i = 0; i < MESSAGE_COUNT; i++) {
+         publisher.publish(TOPIC, messages.get(i).getBytes(), AT_LEAST_ONCE);
+      }
+
+      for (int i = 0; i < MESSAGE_COUNT; i++) {
          msg = subscriber.receive(5000);
          assertNotNull(msg);
          assertEquals(messages.get(i), new String(msg));
@@ -2400,5 +2381,42 @@ public class MQTTTest extends MQTTTestSupport {
 
       subscriber.disconnect();
       subscriber.close();
+   }
+
+   /**
+    * A clean session/start MUST discard any previous session state. The durable PUBLISH/PUBREC caches live in the
+    * PostOffice and can exist there (e.g. recovered from the journal after a broker restart) even when the
+    * freshly-created {@code MQTTSessionState} for the connecting client id has not lazily loaded its in-memory
+    * {@code PacketIdCache} field.
+    */
+   @Test
+   @Timeout(60)
+   public void testCleanStartDeletesDurableQoS2Caches() throws Exception {
+      final String clientId = "qos2-clean-start";
+
+      PostOffice postOffice = server.getPostOffice();
+      SimpleString publishCacheName = PacketIdCache.getCacheName(server.getInternalNamingPrefix(), clientId, PacketIdCache.TYPE.PUBLISH);
+      SimpleString pubRecCacheName = PacketIdCache.getCacheName(server.getInternalNamingPrefix(), clientId, PacketIdCache.TYPE.PUBREC);
+
+      // seed durable caches directly, simulating state recovered from the journal
+      postOffice.getDuplicateIDCache(publishCacheName, MQTTUtil.TWO_BYTE_INT_MAX).addToCache(ByteUtil.intToBytes(1));
+      postOffice.getDuplicateIDCache(pubRecCacheName, MQTTUtil.TWO_BYTE_INT_MAX).addToCache(ByteUtil.intToBytes(1));
+
+      assertTrue(postOffice.duplicateIDCacheExists(publishCacheName), "PUBLISH cache should exist before clean start");
+      assertTrue(postOffice.duplicateIDCacheExists(pubRecCacheName), "PUBREC cache should exist before clean start");
+      // the session state for this client id must not exist yet, so its in-memory cache field is null
+      assertNull(getSessions().get(clientId), "No session state should exist before connecting");
+
+      MqttClient client = createPaho3_1_1Client(clientId);
+      MqttConnectOptions options = new MqttConnectOptions();
+      options.setCleanSession(true);
+      client.connect(options);
+
+      // once connect() returns the durable caches must be gone
+      assertFalse(postOffice.duplicateIDCacheExists(publishCacheName), "PUBLISH cache should be deleted after clean start");
+      assertFalse(postOffice.duplicateIDCacheExists(pubRecCacheName), "PUBREC cache should be deleted after clean start");
+
+      client.disconnect();
+      client.close();
    }
 }

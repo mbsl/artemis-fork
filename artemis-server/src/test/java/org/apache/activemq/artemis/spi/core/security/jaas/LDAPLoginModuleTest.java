@@ -22,6 +22,7 @@ import javax.naming.NameClassPair;
 import javax.naming.NamingEnumeration;
 import javax.naming.directory.DirContext;
 import javax.naming.directory.InitialDirContext;
+import javax.net.ssl.SSLContext;
 import javax.security.auth.Subject;
 import javax.security.auth.callback.NameCallback;
 import javax.security.auth.callback.PasswordCallback;
@@ -33,6 +34,8 @@ import javax.security.auth.spi.LoginModule;
 import java.lang.invoke.MethodHandles;
 import java.lang.reflect.Field;
 import java.lang.reflect.Modifier;
+import java.net.URL;
+import java.nio.file.Paths;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -42,6 +45,7 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 
+import org.apache.activemq.artemis.core.remoting.impl.ssl.SSLSupport;
 import org.apache.activemq.artemis.logs.AssertionLoggerHandler;
 import org.apache.activemq.artemis.utils.PasswordMaskingUtil;
 import org.apache.activemq.artemis.utils.SensitiveDataCodec;
@@ -99,9 +103,10 @@ public class LDAPLoginModuleTest extends AbstractLdapTestUnit {
          directoryService.setAllowAnonymousAccess(true);
          ldapServer.setDirectoryService(directoryService);
 
-         String keystore = Objects.requireNonNull(this.getClass().getClassLoader().
-            getResource("server-keystore-without-ca.p12")).getFile();
-         ldapServer.setKeystoreFile(keystore);
+         URL keystore = Objects.requireNonNull(this.getClass().getClassLoader().
+            getResource("server-keystore-without-ca.p12"));
+         String keystorePath = Paths.get(keystore.toURI()).toString();
+         ldapServer.setKeystoreFile(keystorePath);
          ldapServer.setCertificatePassword("securepass");
 
          ldapServer.start();
@@ -159,11 +164,12 @@ public class LDAPLoginModuleTest extends AbstractLdapTestUnit {
       env.put(Context.SECURITY_PRINCIPAL, PRINCIPAL);
       env.put(Context.SECURITY_CREDENTIALS, CREDENTIALS);
 
-      // Uncomment to enable SSL debugging
-      // System.setProperty("-Djavax.net.debug", "all");
-      System.setProperty("javax.net.ssl.trustStore", Objects.requireNonNull(this.getClass().
-         getClassLoader().getResource("server-ca-truststore.p12")).getFile());
-      System.setProperty("javax.net.ssl.trustStorePassword", "securepass");
+      SSLContext sslContext = new SSLSupport()
+         .setTruststorePath(Objects.requireNonNull(getClass().getClassLoader().getResource("server-ca-truststore.p12")).getFile())
+         .setTruststorePassword("securepass")
+         .createContext();
+      SSLContext previousDefault = SSLContext.getDefault();
+      SSLContext.setDefault(sslContext);
 
       DirContext ctx = null;
 
@@ -185,8 +191,7 @@ public class LDAPLoginModuleTest extends AbstractLdapTestUnit {
          assertTrue(set.contains("ou=configuration"));
          assertTrue(set.contains("prefNodeName=sysPrefRoot"));
       } finally {
-         System.clearProperty("javax.net.ssl.trustStore");
-         System.clearProperty("javax.net.ssl.trustStorePassword");
+         SSLContext.setDefault(previousDefault);
 
          if (ctx != null) {
             ctx.close();

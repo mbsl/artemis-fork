@@ -14,20 +14,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package org.apache.activemq.artemis.tests.util;
+package org.apache.activemq.artemis.tests.soak.mqtt.resiliency.client;
 
-public class JavaVersionUtil {
-
-   private static boolean isJdk8;
-
-   static {
-      String version = System.getProperty("java.version");
-      if (version != null && version.startsWith("1.8.")) {
-         isJdk8 = true;
-      }
-   }
-
-   public static boolean isJava8() {
-      return isJdk8;
-   }
+public enum MqttVersion {
+   MQTT3, MQTT5
 }

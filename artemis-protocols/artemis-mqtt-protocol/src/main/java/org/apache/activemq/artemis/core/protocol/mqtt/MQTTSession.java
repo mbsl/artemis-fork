@@ -16,12 +16,12 @@
  */
 package org.apache.activemq.artemis.core.protocol.mqtt;
 
+import java.lang.invoke.MethodHandles;
 import java.util.UUID;
 
 import io.netty.buffer.EmptyByteBuf;
 import io.netty.buffer.PooledByteBufAllocator;
 import io.netty.handler.codec.mqtt.MqttMessageBuilders;
-import io.netty.handler.codec.mqtt.MqttProperties;
 import io.netty.handler.codec.mqtt.MqttPublishMessage;
 import io.netty.handler.codec.mqtt.MqttQoS;
 import org.apache.activemq.artemis.api.core.ActiveMQSecurityException;
@@ -33,7 +33,6 @@ import org.apache.activemq.artemis.core.server.impl.ServerSessionImpl;
 import org.apache.activemq.artemis.spi.core.protocol.SessionCallback;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import java.lang.invoke.MethodHandles;
 
 public class MQTTSession {
 
@@ -81,7 +80,7 @@ public class MQTTSession {
                       MQTTConnection connection,
                       MQTTProtocolManager protocolManager,
                       WildcardConfiguration wildcardConfiguration,
-                      OperationContext sessionContext) throws Exception {
+                      OperationContext sessionContext) {
       this.protocolHandler = protocolHandler;
       this.protocolManager = protocolManager;
       this.stateManager = protocolManager.getStateManager();
@@ -92,10 +91,11 @@ public class MQTTSession {
       mqttConnectionManager = new MQTTConnectionManager(this);
       mqttPublishManager = new MQTTPublishManager(this, protocolManager.isCloseMqttConnectionOnPublishAuthorizationFailure());
       sessionCallback = new MQTTSessionCallback(this, connection, protocolManager.getDefaultMaximumInFlightPublishMessages());
-      subscriptionManager = new MQTTSubscriptionManager(this, stateManager);
+      subscriptionManager = new MQTTSubscriptionManager(this);
       retainMessageManager = new MQTTRetainMessageManager(this);
 
-      state = MQTTSessionState.DEFAULT;
+      // placeholder state until CONNECT is processed and the real state is installed via setSessionState()
+      state = new MQTTSessionState((String) null);
 
       logger.debug("MQTT session created: {}", id);
    }
@@ -105,7 +105,6 @@ public class MQTTSession {
     * which is synchronized with MQTTConnectionManager.disconnect
     */
    void start() throws Exception {
-      mqttPublishManager.start();
       subscriptionManager.start();
       stopped = false;
    }
@@ -130,7 +129,8 @@ public class MQTTSession {
          state.setAttached(false);
          state.setDisconnectedTime(System.currentTimeMillis());
          state.clearTopicAliases();
-         state.getOutboundStore().resetSendQuota();
+         state.resetSendQuota();
+         state.clearCoreDeliveryInfo();
 
          if (getVersion() == MQTTVersion.MQTT_5) {
             if (state.getClientSessionExpiryInterval() == 0) {
@@ -231,7 +231,6 @@ public class MQTTSession {
 
    void clean(boolean enforceSecurity) throws Exception {
       subscriptionManager.clean(enforceSecurity);
-      mqttPublishManager.clean();
       state.clear();
    }
 
@@ -271,16 +270,14 @@ public class MQTTSession {
       if (state.getWillStatus() == MQTTSessionState.WillStatus.NOT_SENT) {
          try {
             state.setWillStatus(MQTTSessionState.WillStatus.SENDING);
-            MqttProperties properties;
-            if (state.getWillUserProperties() == null) {
-               properties = MqttProperties.NO_PROPERTIES;
-            } else {
-               properties = new MqttProperties();
-               for (MqttProperties.MqttProperty userProperty : state.getWillUserProperties()) {
-                  properties.add(userProperty);
-               }
-            }
-            MqttPublishMessage publishMessage = MqttMessageBuilders.publish().messageId(0).qos(MqttQoS.valueOf(state.getWillQoSLevel())).retained(state.isWillRetain()).topicName(state.getWillTopic()).payload(state.getWillMessage() == null ? new EmptyByteBuf(PooledByteBufAllocator.DEFAULT) : state.getWillMessage()).properties(properties).build();
+            MqttPublishMessage publishMessage = MqttMessageBuilders
+                .publish()
+                .messageId(0)
+                .qos(MqttQoS.valueOf(state.getWillQoSLevel()))
+                .retained(state.isWillRetain())
+                .topicName(state.getWillTopic())
+                .payload(state.getWillMessage() == null ? new EmptyByteBuf(PooledByteBufAllocator.DEFAULT) : state.getWillMessage())
+                .properties(state.getWillPublishProperties()).build();
             logger.debug("{} sending will message: {}", this, publishMessage);
             getMqttPublishManager().sendToQueue(publishMessage, true);
             state.setWillStatus(MQTTSessionState.WillStatus.SENT);

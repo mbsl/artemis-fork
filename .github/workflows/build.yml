@@ -2,6 +2,8 @@ name: "Build"
 
 on:
   push:
+    branches-ignore:
+      - dependabot/**
     paths-ignore: &ignored_paths
       - '**.adoc'
   pull_request:
@@ -28,6 +30,7 @@ jobs:
   test:
     name: Test (${{ matrix.java }})
     runs-on: ubuntu-22.04
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -73,6 +76,7 @@ jobs:
   checks:
     name: Checks (${{ matrix.java }})
     runs-on: ubuntu-22.04
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:

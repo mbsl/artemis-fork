@@ -1051,7 +1051,8 @@ public class PostOfficeImpl implements PostOffice, NotificationListener, Binding
       }
    }
 
-   private void deleteDuplicateCache(SimpleString address) throws Exception {
+   @Override
+   public void deleteDuplicateCache(SimpleString address) throws Exception {
       DuplicateIDCache cache = duplicateIDCaches.remove(address);
 
       if (cache != null) {
@@ -1367,6 +1368,7 @@ public class PostOfficeImpl implements PostOffice, NotificationListener, Binding
          status = RoutingStatus.NO_BINDINGS;
          logger.debug("Message {} is not going anywhere as it didn't have a binding on address:{}", message, address);
          if (message.isLargeMessage()) {
+            message.setDropped(true);
             ((LargeServerMessage) message).deleteFile();
          }
       }
@@ -1473,6 +1475,11 @@ public class PostOfficeImpl implements PostOffice, NotificationListener, Binding
 
    private int resolveIdCacheSize(SimpleString address) {
       return Objects.requireNonNullElse(addressSettingsRepository.getMatch(address.toString()).getIDCacheSize(), idCacheSize);
+   }
+
+   @Override
+   public boolean duplicateIDCacheExists(final SimpleString address) {
+      return duplicateIDCaches.containsKey(address);
    }
 
    @Override
@@ -1691,22 +1698,6 @@ public class PostOfficeImpl implements PostOffice, NotificationListener, Binding
       final SimpleString messageAddress = message.getAddressSimpleString();
       final PagingStore owningStore = pagingManager.getPageStore(messageAddress);
       message.setOwner(owningStore);
-
-      boolean dropMessages = false;
-      if (owningStore != null && !owningStore.checkFullPolicy(message)) {
-         dropMessages = true;
-      }
-      for (Map.Entry<SimpleString, RouteContextList> entry : context.getContexListing().entrySet()) {
-         final PagingStore store = entry.getValue().getAddressStore();
-         if (store != null && store != owningStore && !store.checkFullPolicy(message)) {
-            dropMessages = true;
-         }
-      }
-
-      if (dropMessages) {
-         return;
-      }
-
       for (Map.Entry<SimpleString, RouteContextList> entry : context.getContexListing().entrySet()) {
          final PagingStore store;
          if (entry.getKey().equals(messageAddress)) {
@@ -1716,9 +1707,17 @@ public class PostOfficeImpl implements PostOffice, NotificationListener, Binding
          }
 
          if (store != null && storageManager.addToPage(store, message, context.getTransaction(), entry.getValue())) {
-            // We need to kick delivery so the Queues may check for the cursors case they are empty
-            schedulePageDelivery(tx, entry);
+            if (!message.isDropped()) {
+               // we schedule prefetch checks when messages are added
+               schedulePageDelivery(tx, entry);
+            }
             continue;
+         }
+
+         if (message.isDropped()) {
+            // this should never happen
+            // adding defensive code just in case
+            throw new IllegalStateException("Paging returned false (NOT_PAGED) for a dropped message");
          }
 
          final List<Queue> nonDurableQueues = entry.getValue().getNonDurableQueues();
@@ -1741,11 +1740,19 @@ public class PostOfficeImpl implements PostOffice, NotificationListener, Binding
          }
       }
 
+      if (message.isDropped()) {
+         if (startedTX) {
+            // the transaction here should be empty
+            // calling rollback just for correctness
+            tx.rollback();
+         }
+         return;
+      }
+
       if (mirrorControllerSource != null && !context.isMirrorDisabled()) {
          // we check for isMirrorDisabled as to avoid recursive loop from there
          mirrorControllerSource.sendMessage(tx, message, context);
       }
-
 
       if (tx != null) {
          tx.addOperation(new AddOperation(refs));

@@ -16,19 +16,26 @@
  */
 package org.apache.activemq.artemis.core.protocol.mqtt;
 
+import java.lang.invoke.MethodHandles;
+
 import org.apache.activemq.artemis.api.core.SimpleString;
+import org.apache.activemq.artemis.core.persistence.impl.journal.ActiveMQIDGeneratorStoppedException;
 import org.apache.activemq.artemis.core.server.MessageReference;
 import org.apache.activemq.artemis.core.server.ServerConsumer;
 import org.apache.activemq.artemis.spi.core.protocol.SessionCallback;
 import org.apache.activemq.artemis.spi.core.remoting.ReadyListener;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 public class MQTTSessionCallback implements SessionCallback {
+
+   private static final Logger logger = LoggerFactory.getLogger(MethodHandles.lookup().lookupClass());
 
    private final MQTTSession session;
    private final MQTTConnection connection;
    private final int defaultMaximumInFlightPublishMessages;
 
-   public MQTTSessionCallback(MQTTSession session, MQTTConnection connection, int defaultMaximumInFlightPublishMessages) throws Exception {
+   public MQTTSessionCallback(MQTTSession session, MQTTConnection connection, int defaultMaximumInFlightPublishMessages) {
       this.session = session;
       this.connection = connection;
       this.defaultMaximumInFlightPublishMessages = defaultMaximumInFlightPublishMessages;
@@ -49,9 +56,11 @@ public class MQTTSessionCallback implements SessionCallback {
                           ServerConsumer consumer,
                           int deliveryCount) {
       try {
-         session.getMqttPublishManager().sendMessage(ref.getMessage().toCore(), consumer, deliveryCount);
+         session.getMqttPublishManager().publishToClient(ref.getMessage().toCore(), consumer);
+      } catch (ActiveMQIDGeneratorStoppedException ignored) {
+         logger.debug("Unable to send message to MQTT client because the storage manager is stopping; consumer: {}; message: {}", consumer, ref, ignored);
       } catch (Exception e) {
-         MQTTLogger.LOGGER.unableToSendMessage(ref, e);
+         MQTTLogger.LOGGER.unableToSendMessage(session.getState().getClientId(), ref, e);
       }
       return 1;
    }
@@ -110,7 +119,7 @@ public class MQTTSessionCallback implements SessionCallback {
        * Therefore, enforce flow-control based on the number of pending QoS 1 & 2 messages
        */
       int maxInFlightPublishMessages = connection.getReceiveMaximum() > 0 ? connection.getReceiveMaximum() : defaultMaximumInFlightPublishMessages;
-      if (ref != null && ref.isDurable() == true && maxInFlightPublishMessages > 0 && session.getState().getOutboundStore().getSendQuota() >= maxInFlightPublishMessages) {
+      if (ref != null && ref.isDurable() == true && maxInFlightPublishMessages > 0 && session.getState().getSendQuota() >= maxInFlightPublishMessages) {
          return false;
       } else {
          return true;

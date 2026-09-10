@@ -392,7 +392,7 @@ public class ActiveMQServerImpl implements ActiveMQServer {
 
    private final ActiveMQServer parentServer;
 
-   private CriticalAnalyzer analyzer;
+   private volatile CriticalAnalyzer analyzer;
 
    // This is a callback to be called right before an activation is created
    private Runnable afterActivationCreated;
@@ -637,12 +637,12 @@ public class ActiveMQServerImpl implements ActiveMQServer {
          } else if (haType == null || haType == HAPolicyConfiguration.TYPE.PRIMARY_ONLY) {
             logger.debug("Detected no Shared Store HA options on JDBC store");
             //PRIMARY_ONLY should be the default HA option when HA isn't configured
-            manager = new FileLockNodeManager(directory, replicatingBackup, configuration.getJournalLockAcquisitionTimeout(), scheduledPool);
+            manager = new FileLockNodeManager(directory, replicatingBackup, configuration, scheduledPool);
          } else {
             throw new IllegalArgumentException("JDBC persistence allows only Shared Store HA options");
          }
       } else {
-         manager = new FileLockNodeManager(directory, replicatingBackup, configuration.getJournalLockAcquisitionTimeout(), scheduledPool);
+         manager = new FileLockNodeManager(directory, replicatingBackup, configuration, scheduledPool);
       }
       return manager;
    }
@@ -761,7 +761,7 @@ public class ActiveMQServerImpl implements ActiveMQServer {
 
          ActiveMQServerLogger.LOGGER.serverStarting((haPolicy.isBackup() ? "Backup" : "Primary"), configuration);
 
-         startLockCoordinators();
+         createLockCoordinators();
 
          final boolean wasPrimary = !haPolicy.isBackup();
          if (!haPolicy.isBackup()) {
@@ -821,7 +821,15 @@ public class ActiveMQServerImpl implements ActiveMQServer {
       }
    }
 
-   private void startLockCoordinators() {
+   /**
+    * Instantiates the configured lock managers and creates the {@link LockCoordinator}s, making them available
+    * through {@link #getLockCoordinator(String)} for acceptors and broker connections to look up by name. This runs
+    * unconditionally on every {@link #internalStart()}, well before the server is activated, so the coordinators
+    * must exist here for that lookup to succeed. It does NOT start polling for the lock: that only happens once the
+    * server actually becomes active, in {@link #startLockCoordinators()}, called from {@link #completeActivation}.
+    * Otherwise a passive backup (or any node that hasn't been chosen to activate) would contend for the lock too.
+    */
+   private void createLockCoordinators() {
       for (LockCoordinatorConfiguration lockCoordinatorConfiguration : configuration.getLockCoordinatorConfigurations()) {
          String className = lockCoordinatorConfiguration.getClassName();
          String name = lockCoordinatorConfiguration.getName();
@@ -838,9 +846,24 @@ public class ActiveMQServerImpl implements ActiveMQServer {
          }
 
          LockCoordinator lockCoordinator = new LockCoordinator(scheduledPool, executorFactory.getExecutor(), checkPeriod, lockManager, lockId, name);
+         lockCoordinator.setAutoStart(lockCoordinatorConfiguration.isAutoStart());
          lockCoordinators.put(name, lockCoordinator);
-         ActiveMQServerLogger.LOGGER.lockCoordinatorStarting(name, className, lockId, checkPeriod);
-         lockCoordinator.start();
+      }
+   }
+
+   /**
+    * Starts polling for the distributed lock on every created {@link LockCoordinator} configured with
+    * {@code auto-start=true} (the default) that isn't already started. Called from {@link #completeActivation} so
+    * that only the node that actually became active contends for the lock; a coordinator configured with
+    * {@code auto-start=false} is left stopped until it's started explicitly through management
+    * ({@code startLockCoordinator}).
+    */
+   private void startLockCoordinators() {
+      for (LockCoordinator lockCoordinator : lockCoordinators.values()) {
+         if (lockCoordinator.isAutoStart() && !lockCoordinator.isStarted()) {
+            ActiveMQServerLogger.LOGGER.lockCoordinatorStarting(lockCoordinator.getName(), lockCoordinator.getLockManager().getClass().getName(), lockCoordinator.getLockId(), lockCoordinator.getPeriod());
+            lockCoordinator.start();
+         }
       }
    }
 
@@ -867,8 +890,6 @@ public class ActiveMQServerImpl implements ActiveMQServer {
          } else {
             analyzer = EmptyCriticalAnalyzer.getInstance();
          }
-
-         this.analyzer = analyzer;
       }
 
       /*
@@ -884,7 +905,7 @@ public class ActiveMQServerImpl implements ActiveMQServer {
       final CriticalAnalyzerPolicy criticalAnalyzerPolicy = configuration.getCriticalAnalyzerPolicy();
       CriticalAction criticalAction = switch (criticalAnalyzerPolicy) {
          case HALT -> criticalComponent -> {
-            if (ActiveMQServerImpl.this.state == SERVER_STATE.STARTING) {
+            if (!isActive()) {
                takingLongToStart(criticalComponent);
             } else {
                checkCriticalAnalyzerLogging();
@@ -897,7 +918,7 @@ public class ActiveMQServerImpl implements ActiveMQServer {
             }
          };
          case SHUTDOWN -> criticalComponent -> {
-            if (ActiveMQServerImpl.this.state == SERVER_STATE.STARTING) {
+            if (!isActive()) {
                takingLongToStart(criticalComponent);
             } else {
                checkCriticalAnalyzerLogging();
@@ -922,7 +943,7 @@ public class ActiveMQServerImpl implements ActiveMQServer {
             }
          };
          case LOG -> criticalComponent -> {
-            if (ActiveMQServerImpl.this.state == SERVER_STATE.STARTING) {
+            if (!isActive()) {
                takingLongToStart(criticalComponent);
             } else {
                checkCriticalAnalyzerLogging();
@@ -934,6 +955,7 @@ public class ActiveMQServerImpl implements ActiveMQServer {
       };
 
       analyzer.addAction(criticalAction);
+      this.analyzer = analyzer;
    }
 
    private static void checkCriticalAnalyzerLogging() {
@@ -3688,7 +3710,11 @@ public class ActiveMQServerImpl implements ActiveMQServer {
 
    private void startProtocolServices() throws Exception {
       for (ProtocolManagerFactory protocolManagerFactory : protocolManagerFactories) {
-         protocolManagerFactory.loadProtocolServices(this, protocolServices);
+         try {
+            protocolManagerFactory.loadProtocolServices(this, protocolServices);
+         } catch (Exception e) {
+            logger.warn("Unable to load protocol services for: {}", protocolManagerFactory.getProtocols(), e);
+         }
       }
 
       for (ActiveMQComponent protocolComponent : protocolServices) {
@@ -3733,6 +3759,7 @@ public class ActiveMQServerImpl implements ActiveMQServer {
             }
          }
       }
+      startLockCoordinators();
       getRemotingService().startAcceptors();
       activationLatch.countDown();
       callActivationCompleteCallbacks();
@@ -4887,6 +4914,8 @@ public class ActiveMQServerImpl implements ActiveMQServer {
 
          ActiveMQServerLogger.LOGGER.reloadingConfiguration("protocol services");
          updateProtocolServices();
+
+         ActiveMQServerLogger.LOGGER.configurationReloadCompleted();
       }
    }
 
