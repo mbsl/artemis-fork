@@ -16,17 +16,20 @@
  */
 package org.apache.activemq.artemis.core.protocol.mqtt;
 
-import java.util.List;
+import java.lang.invoke.MethodHandles;
 
 import io.netty.buffer.ByteBufAllocator;
 import io.netty.handler.codec.mqtt.MqttConnectMessage;
 import io.netty.handler.codec.mqtt.MqttProperties;
 import io.netty.handler.codec.mqtt.MqttVersion;
 import org.apache.activemq.artemis.api.core.client.ActiveMQClient;
+import org.apache.activemq.artemis.core.persistence.impl.journal.ActiveMQIDGeneratorStoppedException;
 import org.apache.activemq.artemis.core.server.ActiveMQServer;
 import org.apache.activemq.artemis.core.server.ServerSession;
 import org.apache.activemq.artemis.core.server.impl.ServerSessionImpl;
 import org.apache.activemq.artemis.utils.UUIDGenerator;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import static io.netty.handler.codec.mqtt.MqttProperties.MqttPropertyType.ASSIGNED_CLIENT_IDENTIFIER;
 import static io.netty.handler.codec.mqtt.MqttProperties.MqttPropertyType.AUTHENTICATION_METHOD;
@@ -42,6 +45,8 @@ import static io.netty.handler.codec.mqtt.MqttProperties.MqttPropertyType.WILL_D
  * events.
  */
 public class MQTTConnectionManager {
+
+   private static final Logger logger = LoggerFactory.getLogger(MethodHandles.lookup().lookupClass());
 
    private MQTTSession session;
 
@@ -93,18 +98,21 @@ public class MQTTConnectionManager {
          session.getState().setWillRetain(connect.variableHeader().isWillRetain());
          session.getState().setWillTopic(connect.payload().willTopic());
          session.getState().setWillStatus(MQTTSessionState.WillStatus.NOT_SENT);
+         session.getState().setWillDelayInterval(0);
+         session.getState().setWillPublishProperties(MqttProperties.NO_PROPERTIES);
 
          if (session.getVersion() == MQTTVersion.MQTT_5) {
             MqttProperties willProperties = connect.payload().willProperties();
             if (willProperties != null) {
-               MqttProperties.MqttProperty willDelayInterval = willProperties.getProperty(WILL_DELAY_INTERVAL.value());
-               if (willDelayInterval != null) {
-                  session.getState().setWillDelayInterval((int) willDelayInterval.value());
+               MqttProperties publishProperties = new MqttProperties();
+               for (MqttProperties.MqttProperty property : willProperties.listAll()) {
+                  if (property.propertyId() == WILL_DELAY_INTERVAL.value()) {
+                     session.getState().setWillDelayInterval((int) property.value());
+                  } else {
+                     publishProperties.add(property);
+                  }
                }
-               List<? extends MqttProperties.MqttProperty> userProperties = willProperties.getProperties(MqttProperties.MqttPropertyType.USER_PROPERTY.value());
-               if (userProperties != null) {
-                  session.getState().setWillUserProperties(userProperties);
-               }
+               session.getState().setWillPublishProperties(publishProperties);
             }
          }
       }
@@ -123,10 +131,21 @@ public class MQTTConnectionManager {
          connackProperties = MqttProperties.NO_PROPERTIES;
       }
 
+      if (sessionState.getClientSessionExpiryInterval() == -1 || sessionState.getClientSessionExpiryInterval() > 0) {
+         session.getStateManager().storeDurableState(sessionState);
+      }
+
       session.getConnection().setConnected(true);
       session.getProtocolHandler().sendConnack(MQTTReasonCodes.SUCCESS, sessionPresent && !cleanStart, connackProperties);
-      // ensure we don't publish before the CONNACK
-      session.start();
+      // [MQTT-3.2.0-1] the CONNACK is sent via IO callback so the session should be started the same way to avoid a race
+      session.getProtocolHandler().runAfterStorageOperations(() -> {
+         try {
+            session.start();
+         } catch (Exception e) {
+            MQTTLogger.LOGGER.errorDisconnectingClient(e);
+            disconnect(true);
+         }
+      });
    }
 
    private MqttProperties getConnackProperties() {
@@ -182,6 +201,8 @@ public class MQTTConnectionManager {
       try {
          session.stop(failure);
          session.getConnection().destroy();
+      } catch (ActiveMQIDGeneratorStoppedException ignored) {
+         logger.debug("Unable to cleanly disconnect MQTT client {} because the storage manager is stopping", session.getState().getClientId(), ignored);
       } catch (Exception e) {
          MQTTLogger.LOGGER.errorDisconnectingClient(e);
       } finally {

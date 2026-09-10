@@ -15,6 +15,49 @@ NOTE: Follow the general upgrade procedure outlined in the xref:upgrading.adoc#u
 
 :sectnums!:
 
+== Version 2.56.0
+
+https://issues.apache.org/jira/secure/ReleaseNote.jspa?projectId=12315920&version=12357208[Full release notes]
+
+=== Highlights
+
+* The xref:lock-coordination.adoc#lock-coordination-ha-with-mirroring[lock coordinators] now support a new `auto-start` attribute to control whether a coordinator begins polling for the distributed lock on broker activation, plus new `startLockCoordinator` / `stopLockCoordinator` management operations and matching `lock start` / `lock stop` CLI commands.
+* A lock coordinator that cannot reach its distributed lock store (e.g. ZooKeeper is unreachable) no longer hangs broker shutdown indefinitely.
+* The AMQP protocol module has been updated to proton-j 0.35.0 with a new `maxTransfersPerDelivery` configuration option.
+* The journal file lock health-check behavior is now configurable via the new `journal-lock-monitor-timeout` and `journal-lock-monitor-max-retries` parameters in `broker.xml`.
+See xref:persistence.adoc#configuring-the-message-journal[configuring the message journal] for details.
+* MQTT QoS 1 and QoS 2 message delivery has been redesigned for resiliency across broker restarts and client reconnects.
+
+=== Upgrading from 2.55.0
+
+* Due to https://issues.apache.org/jira/browse/ARTEMIS-6128[ARTEMIS-6128] the `Alder32` and `fileAlder32` properties have been deprecated in favor of `Adler32` and `fileAdler32` respectively.
+* Due to https://issues.apache.org/jira/browse/ARTEMIS-6172[ARTEMIS-6172] the HTTP-specific transport parameters deprecated by https://issues.apache.org/jira/browse/ARTEMIS-5819[ARTEMIS-5819] (`httpClientIdleTime`, `httpClientIdleScanPeriod`, `httpResponseTime`, `httpServerScanPeriod`) are restored.
+These are required so HTTP-tunneled Core connections can create response slots for server-initiated packets (for example cluster topology updates) without starving replies to client requests.
+* Due to https://issues.apache.org/jira/browse/ARTEMIS-6189[ARTEMIS-6189] MQTT QoS 1 and QoS 2 message delivery has been redesigned for resiliency across broker restarts and client reconnects.
+Additional persistent state is now tracked via duplicate ID caches (named `mqtt.qos.publish.<clientId>` and `mqtt.qos.pubrec.<clientId>`) and packet ID correlation records.
+These are internal implementation details, but they will be visible in data tool output.
++
+The per-client internal management queues previously used for QoS 2 PUBREL persistence (named `$sys.mqtt.queue.qos2.<clientId>`) are no longer used.
+It is recommended to allow all in-flight QoS 1 and QoS 2 flows to complete before upgrading so that QoS flow state information is not orphaned in the existing management queues.
+Manual clean-up of these queues may be required after upgrading.
++
+Due to the additional persistent state there will be a performance impact.
+Of course, this is a traditional trade-off for increased reliability.
+The exact impact will depend on your specific use-case.
+Generally speaking, the recommendation is to use the lowest QoS possible to avoid unnecessary overhead.
+
+== Version 2.55.0
+
+https://issues.apache.org/jira/secure/ReleaseNote.jspa?projectId=12315920&version=12357054[Full release notes]
+
+=== Highlights
+
+* The `exp` command from the xref:data-tools.adoc#data-tools[data tools] now supports exporting messages from a specific queue via the `--queue` switch.
+* The xref:security.adoc#oidcloginmodule[OIDCLoginModule] now supports configurable mandatory claims and role mapping via the `requiredClaims` and `roleMapping` parameters.
+* The value for `cluster-password` specified via `create` command is now masked in the resulting `broker.xml`.
+* The timeout for xref:configuring-transports.adoc#configuring-netty-ssl[SSL/TLS] handshake is now configurable on any `acceptor` via the `sslHandshakeTimeout` URL parameter.
+* On the documentation front, we added a comprehensive xref:threat-model.adoc#threat-model[threat model] and a basic https://github.com/apache/artemis/blob/main/SECURITY.md[SECURITY.md] to help both humans and AI agents provide higher quality security reports. We also added an https://github.com/apache/artemis/blob/main/AGENTS.md[AGENTS.md] to help improve the quality of AI-assisted contributions.
+
 == Version 2.54.0
 
 https://issues.apache.org/jira/secure/ReleaseNote.jspa?projectId=12315920&version=12356777[Full release notes]

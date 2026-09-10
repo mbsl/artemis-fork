@@ -21,7 +21,7 @@ import org.apache.activemq.artemis.cli.commands.HelpAction;
 import picocli.CommandLine;
 import picocli.CommandLine.Command;
 
-@Command(name = "lock", description = "Lock coordinators group. use 'help lock' for sub commands list", subcommands = {LockList.class})
+@Command(name = "lock", description = "Lock coordinators group. use 'help lock' for sub commands list", subcommands = {LockList.class, LockStart.class, LockStop.class})
 public class LockGroup implements Runnable {
 
    CommandLine commandLine;

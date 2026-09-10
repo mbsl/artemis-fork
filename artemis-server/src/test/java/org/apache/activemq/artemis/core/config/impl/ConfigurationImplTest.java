@@ -61,10 +61,13 @@ import java.util.stream.Collectors;
 
 import org.apache.activemq.artemis.ArtemisConstants;
 import org.apache.activemq.artemis.api.config.ActiveMQDefaultConfiguration;
+import org.apache.activemq.artemis.api.core.BroadcastGroupConfiguration;
+import org.apache.activemq.artemis.api.core.DiscoveryGroupConfiguration;
 import org.apache.activemq.artemis.api.core.QueueConfiguration;
 import org.apache.activemq.artemis.api.core.RoutingType;
 import org.apache.activemq.artemis.api.core.SimpleString;
 import org.apache.activemq.artemis.api.core.TransportConfiguration;
+import org.apache.activemq.artemis.api.core.UDPBroadcastEndpointFactory;
 import org.apache.activemq.artemis.core.config.Configuration;
 import org.apache.activemq.artemis.core.config.ConfigurationUtils;
 import org.apache.activemq.artemis.core.config.CoreAddressConfiguration;
@@ -104,6 +107,7 @@ import org.apache.activemq.artemis.core.security.Role;
 import org.apache.activemq.artemis.core.server.ComponentConfigurationRoutingType;
 import org.apache.activemq.artemis.core.server.cluster.impl.MessageLoadBalancingType;
 import org.apache.activemq.artemis.core.server.impl.LegacyLDAPSecuritySettingPlugin;
+import org.apache.activemq.artemis.core.server.metrics.plugins.SimpleMetricsPlugin;
 import org.apache.activemq.artemis.core.server.plugin.impl.ConnectionPeriodicExpiryPlugin;
 import org.apache.activemq.artemis.core.server.plugin.impl.LoggingActiveMQServerPlugin;
 import org.apache.activemq.artemis.core.server.routing.KeyType;
@@ -174,6 +178,8 @@ public class ConfigurationImplTest extends AbstractConfigurationTestBase {
       assertEquals(ActiveMQDefaultConfiguration.getDefaultLargeMessagesDir(), conf.getLargeMessagesDirectory());
       assertEquals(ActiveMQDefaultConfiguration.getDefaultJournalCompactPercentage(), conf.getJournalCompactPercentage());
       assertEquals(ActiveMQDefaultConfiguration.getDefaultJournalLockAcquisitionTimeout(), conf.getJournalLockAcquisitionTimeout());
+      assertEquals(ActiveMQDefaultConfiguration.getDefaultJournalLockMonitorTimeout(), conf.getJournalLockMonitorTimeout());
+      assertEquals(ActiveMQDefaultConfiguration.getDefaultJournalLockMonitorMaxRetries(), conf.getJournalLockMonitorMaxRetries());
       assertEquals(ArtemisConstants.DEFAULT_JOURNAL_BUFFER_TIMEOUT_AIO, conf.getJournalBufferTimeout_AIO());
       assertEquals(ArtemisConstants.DEFAULT_JOURNAL_BUFFER_TIMEOUT_NIO, conf.getJournalBufferTimeout_NIO());
       assertEquals(ArtemisConstants.DEFAULT_JOURNAL_BUFFER_SIZE_AIO, conf.getJournalBufferSize_AIO());
@@ -2374,6 +2380,187 @@ public class ConfigurationImplTest extends AbstractConfigurationTestBase {
    }
 
    @Test
+   public void testDatabaseStoreConfigurationJsonClassDiscriminator() throws Exception {
+      File tmpFile = File.createTempFile("store-config-json-class-test", ".json", temporaryFolder);
+      try (FileOutputStream fileOutputStream = new FileOutputStream(tmpFile);
+           PrintWriter printWriter = new PrintWriter(fileOutputStream)) {
+         printWriter.write("{\n");
+         printWriter.write("  \"storeConfiguration\": {\n");
+         printWriter.write("    \"_class\": \"DATABASE\",\n");
+         printWriter.write("    \"largeMessageTableName\": \"lmtn\",\n");
+         printWriter.write("    \"messageTableName\": \"mtn\",\n");
+         printWriter.write("    \"bindingsTableName\": \"btn\",\n");
+         printWriter.write("    \"jdbcConnectionUrl\": \"url\",\n");
+         printWriter.write("    \"jdbcDriverClassName\": \"dcn\",\n");
+         printWriter.write("    \"jdbcUser\": \"user\"\n");
+         printWriter.write("  }\n");
+         printWriter.write("}\n");
+      }
+
+      ConfigurationImpl configuration = new ConfigurationImpl();
+      configuration.parseProperties(tmpFile.getAbsolutePath());
+
+      assertTrue(configuration.getStatus().contains("\"errors\":[]"));
+
+      assertInstanceOf(DatabaseStorageConfiguration.class, configuration.getStoreConfiguration());
+      DatabaseStorageConfiguration dsc = (DatabaseStorageConfiguration) configuration.getStoreConfiguration();
+      assertEquals("lmtn", dsc.getLargeMessageTableName());
+      assertEquals("mtn", dsc.getMessageTableName());
+      assertEquals("btn", dsc.getBindingsTableName());
+      assertEquals("url", dsc.getJdbcConnectionUrl());
+      assertEquals("dcn", dsc.getJdbcDriverClassName());
+      assertEquals("user", dsc.getJdbcUser());
+   }
+
+   @Test
+   public void testHAPolicyConfigurationJsonClassDiscriminator() throws Exception {
+      File tmpFile = File.createTempFile("ha-config-json-class-test", ".json", temporaryFolder);
+      try (FileOutputStream fileOutputStream = new FileOutputStream(tmpFile);
+           PrintWriter printWriter = new PrintWriter(fileOutputStream)) {
+         printWriter.write("{\n");
+         printWriter.write("  \"HAPolicyConfiguration\": {\n");
+         printWriter.write("    \"_class\": \"SHARED_STORE_PRIMARY\",\n");
+         printWriter.write("    \"failoverOnServerShutdown\": true,\n");
+         printWriter.write("    \"waitForActivation\": false\n");
+         printWriter.write("  }\n");
+         printWriter.write("}\n");
+      }
+
+      ConfigurationImpl configuration = new ConfigurationImpl();
+      configuration.parseProperties(tmpFile.getAbsolutePath());
+
+      assertTrue(configuration.getStatus().contains("\"errors\":[]"));
+
+      HAPolicyConfiguration haPolicyConfiguration = configuration.getHAPolicyConfiguration();
+      assertEquals(SharedStorePrimaryPolicyConfiguration.class, haPolicyConfiguration.getClass());
+
+      SharedStorePrimaryPolicyConfiguration sharedStorePrimaryPolicyConfiguration =
+         (SharedStorePrimaryPolicyConfiguration) haPolicyConfiguration;
+      assertTrue(sharedStorePrimaryPolicyConfiguration.isFailoverOnServerShutdown());
+      assertFalse(sharedStorePrimaryPolicyConfiguration.isWaitForActivation());
+   }
+
+   @Test
+   public void testJsonClassDiscriminatorOrderIndependent() throws Exception {
+      // _class appears AFTER sub-properties — must still work
+      File tmpFile = File.createTempFile("class-order-test", ".json", temporaryFolder);
+      try (FileOutputStream fileOutputStream = new FileOutputStream(tmpFile);
+           PrintWriter printWriter = new PrintWriter(fileOutputStream)) {
+         printWriter.write("{\n");
+         printWriter.write("  \"storeConfiguration\": {\n");
+         printWriter.write("    \"largeMessageTableName\": \"lmtn\",\n");
+         printWriter.write("    \"jdbcConnectionUrl\": \"url\",\n");
+         printWriter.write("    \"_class\": \"DATABASE\"\n");
+         printWriter.write("  }\n");
+         printWriter.write("}\n");
+      }
+
+      ConfigurationImpl configuration = new ConfigurationImpl();
+      configuration.parseProperties(tmpFile.getAbsolutePath());
+
+      assertTrue(configuration.getStatus().contains("\"errors\":[]"));
+
+      assertInstanceOf(DatabaseStorageConfiguration.class, configuration.getStoreConfiguration());
+      DatabaseStorageConfiguration dsc = (DatabaseStorageConfiguration) configuration.getStoreConfiguration();
+      assertEquals("lmtn", dsc.getLargeMessageTableName());
+      assertEquals("url", dsc.getJdbcConnectionUrl());
+   }
+
+   @Test
+   public void testMetricsPluginJsonClassDiscriminator() throws Exception {
+      File tmpFile = File.createTempFile("metrics-json-class-test", ".json", temporaryFolder);
+      try (FileOutputStream fileOutputStream = new FileOutputStream(tmpFile);
+           PrintWriter printWriter = new PrintWriter(fileOutputStream)) {
+         printWriter.write("{\n");
+         printWriter.write("  \"metricsConfiguration\": {\n");
+         printWriter.write("    \"plugin\": {\n");
+         printWriter.write("      \"_class\": \"org.apache.activemq.artemis.core.server.metrics.plugins.SimpleMetricsPlugin.class\",\n");
+         printWriter.write("      \"init\": \"\"\n");
+         printWriter.write("    },\n");
+         printWriter.write("    \"jvmMemory\": false\n");
+         printWriter.write("  }\n");
+         printWriter.write("}\n");
+      }
+
+      ConfigurationImpl configuration = new ConfigurationImpl();
+      configuration.parseProperties(tmpFile.getAbsolutePath());
+
+      assertTrue(configuration.getStatus().contains("\"errors\":[]"), configuration.getStatus());
+
+      assertNotNull(configuration.getMetricsConfiguration());
+      assertNotNull(configuration.getMetricsConfiguration().getPlugin());
+      assertInstanceOf(SimpleMetricsPlugin.class, configuration.getMetricsConfiguration().getPlugin());
+      assertFalse(configuration.getMetricsConfiguration().isJvmMemory());
+   }
+
+   @Test
+   public void testBroadcastEndpointFactoryJsonClassDiscriminator() throws Exception {
+      File tmpFile = File.createTempFile("broadcast-json-class-test", ".json", temporaryFolder);
+      try (FileOutputStream fileOutputStream = new FileOutputStream(tmpFile);
+           PrintWriter printWriter = new PrintWriter(fileOutputStream)) {
+         printWriter.write("{\n");
+         printWriter.write("  \"broadcastGroupConfigurations\": {\n");
+         printWriter.write("    \"bg1\": {\n");
+         printWriter.write("      \"broadcastPeriod\": 1234,\n");
+         printWriter.write("      \"endpointFactory\": {\n");
+         printWriter.write("        \"_class\": \"org.apache.activemq.artemis.api.core.UDPBroadcastEndpointFactory.class\",\n");
+         printWriter.write("        \"groupAddress\": \"231.7.7.7\",\n");
+         printWriter.write("        \"groupPort\": 9876\n");
+         printWriter.write("      }\n");
+         printWriter.write("    }\n");
+         printWriter.write("  }\n");
+         printWriter.write("}\n");
+      }
+
+      ConfigurationImpl configuration = new ConfigurationImpl();
+      configuration.parseProperties(tmpFile.getAbsolutePath());
+
+      assertTrue(configuration.getStatus().contains("\"errors\":[]"), configuration.getStatus());
+
+      assertEquals(1, configuration.getBroadcastGroupConfigurations().size());
+      BroadcastGroupConfiguration bg = configuration.getBroadcastGroupConfigurations().get(0);
+      assertEquals(1234, bg.getBroadcastPeriod());
+      assertInstanceOf(UDPBroadcastEndpointFactory.class, bg.getEndpointFactory());
+      UDPBroadcastEndpointFactory udp = (UDPBroadcastEndpointFactory) bg.getEndpointFactory();
+      assertEquals("231.7.7.7", udp.getGroupAddress());
+      assertEquals(9876, udp.getGroupPort());
+   }
+
+   @Test
+   public void testDiscoveryEndpointFactoryJsonClassDiscriminator() throws Exception {
+      File tmpFile = File.createTempFile("discovery-json-class-test", ".json", temporaryFolder);
+      try (FileOutputStream fileOutputStream = new FileOutputStream(tmpFile);
+           PrintWriter printWriter = new PrintWriter(fileOutputStream)) {
+         printWriter.write("{\n");
+         printWriter.write("  \"discoveryGroupConfigurations\": {\n");
+         printWriter.write("    \"dg1\": {\n");
+         printWriter.write("      \"refreshTimeout\": 5000,\n");
+         printWriter.write("      \"broadcastEndpointFactory\": {\n");
+         printWriter.write("        \"_class\": \"org.apache.activemq.artemis.api.core.UDPBroadcastEndpointFactory.class\",\n");
+         printWriter.write("        \"groupAddress\": \"231.7.7.7\",\n");
+         printWriter.write("        \"groupPort\": 9877\n");
+         printWriter.write("      }\n");
+         printWriter.write("    }\n");
+         printWriter.write("  }\n");
+         printWriter.write("}\n");
+      }
+
+      ConfigurationImpl configuration = new ConfigurationImpl();
+      configuration.parseProperties(tmpFile.getAbsolutePath());
+
+      assertTrue(configuration.getStatus().contains("\"errors\":[]"), configuration.getStatus());
+
+      assertEquals(1, configuration.getDiscoveryGroupConfigurations().size());
+      DiscoveryGroupConfiguration dg = configuration.getDiscoveryGroupConfigurations().get("dg1");
+      assertNotNull(dg);
+      assertEquals(5000, dg.getRefreshTimeout());
+      assertInstanceOf(UDPBroadcastEndpointFactory.class, dg.getBroadcastEndpointFactory());
+      UDPBroadcastEndpointFactory udp = (UDPBroadcastEndpointFactory) dg.getBroadcastEndpointFactory();
+      assertEquals("231.7.7.7", udp.getGroupAddress());
+      assertEquals(9877, udp.getGroupPort());
+   }
+
+   @Test
    public void testEnumConversion() throws Exception {
       ConfigurationImpl configuration = new ConfigurationImpl();
       Properties properties = new Properties();
@@ -2439,13 +2626,50 @@ public class ConfigurationImplTest extends AbstractConfigurationTestBase {
    }
 
    @Test
+   public void testJsonAMQPConnectionUriOrderIndependent() throws Exception {
+      // transportConfigurations appears BEFORE uri in JSON — this simulates what happens
+      // when a JSON serializer sorts keys alphabetically (e.g., Go's json.Marshal),
+      // since "transportConfigurations" < "uri" lexically.
+      // Without the scalars-before-objects fix, getTransportConfigurations() lazily calls
+      // parseURI() before uri is set, causing trustStorePassword to be silently lost.
+      File tmpFile = File.createTempFile("amqp-uri-order-test", ".json", temporaryFolder);
+      try (FileOutputStream fileOutputStream = new FileOutputStream(tmpFile);
+           PrintWriter printWriter = new PrintWriter(fileOutputStream)) {
+
+         printWriter.write("{\n");
+         printWriter.write("  \"AMQPConnections\" : {\n");
+         printWriter.write("    \"target\" : {\n");
+         printWriter.write("      \"transportConfigurations\" : {\n");
+         printWriter.write("        \"target\" : {\n");
+         printWriter.write("          \"params\" : { \"trustStorePassword\" : \"pass\"\n }\n");
+         printWriter.write("        }\n");
+         printWriter.write("      },\n");
+         printWriter.write("      \"uri\" : \"tcp://host:6449?trustStorePath=/client.ts\"\n");
+         printWriter.write("    }\n");
+         printWriter.write("  }\n");
+         printWriter.write("}\n");
+      }
+
+      ConfigurationImpl configuration = new ConfigurationImpl();
+      configuration.parseProperties(tmpFile.getAbsolutePath());
+
+      String matchNoErrors = "\"errors\":\\[]";
+      assertEquals(3, configuration.getStatus().split(matchNoErrors, 10).length, configuration.getStatus());
+
+      Map<String, Object> params = configuration.getAMQPConnections().get(0).getTransportConfigurations().get(0).getParams();
+      assertEquals(4, params.size(), "Expected 4 params: host, port, trustStorePath (from URI), trustStorePassword (explicit)");
+      assertEquals("/client.ts", params.get("trustStorePath"));
+      assertEquals("pass", params.get("trustStorePassword"));
+   }
+
+   @Test
    public void testTextPropertiesReaderFromFile() throws Exception {
       List<String> textProperties = buildSimpleConfigTextList();
       File tmpFile = File.createTempFile("text-props-test", "", temporaryFolder);
       try (FileOutputStream fileOutputStream = new FileOutputStream(tmpFile);
            PrintWriter printWriter = new PrintWriter(fileOutputStream)) {
          for (String textProperty : textProperties) {
-            printWriter.println(textProperty);
+            printWriter.print(textProperty + "\n");
          }
       }
 
@@ -2454,6 +2678,7 @@ public class ConfigurationImplTest extends AbstractConfigurationTestBase {
 
       testSimpleConfig(configuration);
       assertTrue(configuration.getStatus().contains("\"fileAlder32\":\"2235122473\""));
+      assertTrue(configuration.getStatus().contains("\"fileAdler32\":\"2235122473\""));
    }
 
    @Test
@@ -2471,6 +2696,7 @@ public class ConfigurationImplTest extends AbstractConfigurationTestBase {
 
       testSimpleConfig(configuration);
       assertTrue(configuration.getStatus().contains("\"fileAlder32\":\"1145294432\""));
+      assertTrue(configuration.getStatus().contains("\"fileAdler32\":\"1145294432\""));
    }
 
    @Test
@@ -2587,6 +2813,147 @@ public class ConfigurationImplTest extends AbstractConfigurationTestBase {
       configuration.parseProperties(tmpFile.getAbsolutePath());
       assertTrue(configuration.getStatus().contains(".json\":{\"errors\":[]"), configuration.getStatus());
       assertEquals("$$", configuration.getBrokerPropertiesKeySurround());
+   }
+
+   @Test
+   public void testYamlSecurityRolesWithAnchors() throws Exception {
+
+      File tmpFile = File.createTempFile("yaml-security-roles-test", ".yaml", temporaryFolder);
+      try (FileOutputStream fileOutputStream = new FileOutputStream(tmpFile);
+           PrintWriter printWriter = new PrintWriter(fileOutputStream)) {
+         printWriter.write("""
+            securityRoles:
+              "TEMP.*":
+                role1: &base_perms
+                  createAddress: true
+                  send: true
+                  consume: true
+                  createNonDurableQueue: true
+                role2: *base_perms
+                role3: *base_perms
+            """);
+      }
+
+      ConfigurationImpl configuration = new ConfigurationImpl();
+      configuration.parseProperties(tmpFile.getAbsolutePath());
+
+      assertTrue(configuration.getStatus().contains("\"errors\":[]"), configuration.getStatus());
+
+      Set<Role> roles = configuration.getSecurityRoles().get("TEMP.*");
+      assertNotNull(roles, "Expected security roles for TEMP.*");
+      assertEquals(3, roles.size(), "Expected 3 roles under TEMP.*");
+
+      for (String roleName : new String[]{"role1", "role2", "role3"}) {
+         Role role = roles.stream()
+            .filter(r -> r.getName().equals(roleName))
+            .findFirst()
+            .orElse(null);
+         assertNotNull(role, "Missing role: " + roleName);
+         assertTrue(role.isCreateAddress(), roleName + " should have createAddress");
+         assertTrue(role.isSend(), roleName + " should have send");
+         assertTrue(role.isConsume(), roleName + " should have consume");
+         assertTrue(role.isCreateNonDurableQueue(), roleName + " should have createNonDurableQueue");
+      }
+   }
+
+   @Test
+   public void testYamlPropertiesReaderFromFile() throws Exception {
+
+      File tmpFile = File.createTempFile("yaml-props-test", ".yaml", temporaryFolder);
+      try (FileOutputStream fileOutputStream = new FileOutputStream(tmpFile);
+           PrintWriter printWriter = new PrintWriter(fileOutputStream)) {
+         printWriter.write("""
+            globalMaxSize: "25K"
+            gracefulShutdownEnabled: true
+            securityEnabled: false
+            """);
+      }
+
+      ConfigurationImpl configuration = new ConfigurationImpl();
+      configuration.parseProperties(tmpFile.getAbsolutePath());
+
+      assertTrue(configuration.getStatus().contains("\"errors\":[]"), configuration.getStatus());
+      assertEquals(25 * 1024, configuration.getGlobalMaxSize());
+      assertTrue(configuration.isGracefulShutdownEnabled());
+      assertFalse(configuration.isSecurityEnabled());
+   }
+
+   @Test
+   public void testInvalidYamlPropertiesReaderFromFile() throws Exception {
+
+      File tmpFile = File.createTempFile("yaml-props-test", ".yaml", temporaryFolder);
+      try (FileOutputStream fileOutputStream = new FileOutputStream(tmpFile);
+           PrintWriter printWriter = new PrintWriter(fileOutputStream)) {
+         printWriter.write("{ invalid yaml: [}");
+      }
+
+      ConfigurationImpl configuration = new ConfigurationImpl();
+      configuration.parseProperties(tmpFile.getAbsolutePath());
+
+      assertFalse(configuration.getStatus().contains(".yaml\":{\"errors\":[]"), configuration.getStatus());
+   }
+
+   @Test
+   public void testYamlBillionLaughsRejected() throws Exception {
+
+      File tmpFile = File.createTempFile("yaml-bomb-test", ".yaml", temporaryFolder);
+      try (FileOutputStream fileOutputStream = new FileOutputStream(tmpFile);
+           PrintWriter printWriter = new PrintWriter(fileOutputStream)) {
+         StringBuilder sb = new StringBuilder();
+         sb.append("a: &a [\"lol\"]\n");
+         for (int i = 1; i <= 60; i++) {
+            char prev = (char) ('a' + i - 1);
+            char curr = (char) ('a' + i);
+            sb.append(curr).append(": &").append(curr)
+               .append(" [*").append(prev).append(", *").append(prev)
+               .append(", *").append(prev).append("]\n");
+         }
+         printWriter.write(sb.toString());
+      }
+
+      ConfigurationImpl configuration = new ConfigurationImpl();
+      configuration.parseProperties(tmpFile.getAbsolutePath());
+
+      assertTrue(configuration.getStatus().contains("loadError"), configuration.getStatus());
+   }
+
+   @Test
+   public void testYamlPropertiesKeySurround() throws Exception {
+
+      File tmpFile = File.createTempFile("yaml-surround-props-test", ".yaml", temporaryFolder);
+      try (FileOutputStream fileOutputStream = new FileOutputStream(tmpFile);
+           PrintWriter printWriter = new PrintWriter(fileOutputStream)) {
+         printWriter.write("""
+            key.surround: "$$"
+            addressSettings:
+              $$a."with_quote".b$$:
+                maxDeliveryAttempts: 0
+            """);
+      }
+
+      ConfigurationImpl configuration = new ConfigurationImpl();
+      configuration.parseProperties(tmpFile.getAbsolutePath());
+
+      assertEquals(0, configuration.getAddressSettings().get("a.\"with_quote\".b").getMaxDeliveryAttempts());
+   }
+
+   @Test
+   public void testYamlPropertiesAutoSurround() throws Exception {
+
+      File tmpFile = File.createTempFile("yaml-auto-surround-props-test", ".yaml", temporaryFolder);
+      try (FileOutputStream fileOutputStream = new FileOutputStream(tmpFile);
+           PrintWriter printWriter = new PrintWriter(fileOutputStream)) {
+         printWriter.write("""
+            addressSettings:
+              a.b.c:
+                maxDeliveryAttempts: 2
+            """);
+      }
+
+      ConfigurationImpl configuration = new ConfigurationImpl();
+      configuration.parseProperties(tmpFile.getAbsolutePath());
+
+      assertEquals(2, configuration.getAddressSettings().get("a.b.c").getMaxDeliveryAttempts());
    }
 
    private JsonObject buildSimpleConfigJsonObject() {
@@ -2712,6 +3079,8 @@ public class ConfigurationImplTest extends AbstractConfigurationTestBase {
 
       assertTrue(configuration.getStatus().contains("\"alder32"));
       assertTrue(configuration.getStatus().contains("\"fileAlder32"));
+      assertTrue(configuration.getStatus().contains("\"adler32"));
+      assertTrue(configuration.getStatus().contains("\"fileAdler32"));
    }
 
    @Test
@@ -2828,12 +3197,15 @@ public class ConfigurationImplTest extends AbstractConfigurationTestBase {
       File tmpFile = File.createTempFile("a_stuff", ".properties", temporaryFolder);
       Properties properties = new Properties();
       properties.put("name", "a");
-      properties.store(new FileOutputStream(tmpFile), null);
-
+      try (FileOutputStream out = new FileOutputStream(tmpFile)) {
+         properties.store(out, null);
+      }
       tmpFile = File.createTempFile("b_stuff", ".0-properties", temporaryFolder);
       properties = new Properties();
       properties.put("name", "0");
-      properties.store(new FileOutputStream(tmpFile), null);
+      try (FileOutputStream out = new FileOutputStream(tmpFile)) {
+         properties.store(out, null);
+      }
 
       ConfigurationImpl configuration = new ConfigurationImpl();
       configuration.parseProperties(temporaryFolder + "/");
@@ -2913,6 +3285,7 @@ public class ConfigurationImplTest extends AbstractConfigurationTestBase {
       assertTrue(jsonStatus.contains(UPDATED_SHA));
       assertFalse(jsonStatus.contains(SHA));
       assertTrue(jsonStatus.contains("alder32"));
+      assertTrue(jsonStatus.contains("adler32"));
    }
 
    @Test
@@ -3193,6 +3566,7 @@ public class ConfigurationImplTest extends AbstractConfigurationTestBase {
       properties.put("lockCoordinatorConfigurations.hello.lockId", "lock-id");
       properties.put("lockCoordinatorConfigurations.hello.name", "hello");
       properties.put("lockCoordinatorConfigurations.hello.className", "some.class.somewhere");
+      properties.put("lockCoordinatorConfigurations.hello.autoStart", "false");
       for (int i = 0; i < 10; i++) {
          properties.put("lockCoordinatorConfigurations.hello.properties.k" + i, "v" + i);
       }
@@ -3231,6 +3605,7 @@ public class ConfigurationImplTest extends AbstractConfigurationTestBase {
       assertEquals("lock-id", lockCoordinatorConfiguration.getLockId());
       assertEquals("hello", lockCoordinatorConfiguration.getName());
       assertEquals("some.class.somewhere", lockCoordinatorConfiguration.getClassName());
+      assertFalse(lockCoordinatorConfiguration.isAutoStart());
 
       File outputProperty = new File(getTestDirfile(), "broker.properties");
       configuration.exportAsProperties(outputProperty);

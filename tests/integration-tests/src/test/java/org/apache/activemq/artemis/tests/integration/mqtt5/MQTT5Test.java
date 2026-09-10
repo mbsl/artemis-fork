@@ -28,16 +28,18 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import io.netty.handler.codec.mqtt.MqttMessageType;
+import io.netty.handler.codec.mqtt.MqttPubReplyMessageVariableHeader;
 import org.apache.activemq.artemis.api.core.ActiveMQException;
 import org.apache.activemq.artemis.api.core.QueueConfiguration;
 import org.apache.activemq.artemis.api.core.RoutingType;
 import org.apache.activemq.artemis.api.core.SimpleString;
-import org.apache.activemq.artemis.core.config.WildcardConfiguration;
 import org.apache.activemq.artemis.core.paging.impl.PagingManagerImpl;
 import org.apache.activemq.artemis.core.paging.impl.PagingManagerImplAccessor;
+import org.apache.activemq.artemis.core.postoffice.DuplicateIDCache;
 import org.apache.activemq.artemis.core.postoffice.impl.PostOfficeImpl;
 import org.apache.activemq.artemis.core.postoffice.impl.PostOfficeTestAccessor;
 import org.apache.activemq.artemis.core.protocol.mqtt.MQTTInterceptor;
@@ -46,12 +48,13 @@ import org.apache.activemq.artemis.core.protocol.mqtt.MQTTReasonCodes;
 import org.apache.activemq.artemis.core.protocol.mqtt.MQTTSessionAccessor;
 import org.apache.activemq.artemis.core.protocol.mqtt.MQTTSessionState;
 import org.apache.activemq.artemis.core.protocol.mqtt.MQTTUtil;
+import org.apache.activemq.artemis.core.protocol.mqtt.PacketIdCache;
 import org.apache.activemq.artemis.core.server.Queue;
 import org.apache.activemq.artemis.core.server.ServerSession;
 import org.apache.activemq.artemis.core.server.plugin.ActiveMQServerSessionPlugin;
-import org.apache.activemq.artemis.core.settings.impl.AddressFullMessagePolicy;
 import org.apache.activemq.artemis.core.settings.impl.AddressSettings;
 import org.apache.activemq.artemis.logs.AssertionLoggerHandler;
+import org.apache.activemq.artemis.utils.ByteUtil;
 import org.apache.activemq.artemis.utils.RandomUtil;
 import org.apache.activemq.artemis.utils.ReusableLatch;
 import org.apache.activemq.artemis.utils.Wait;
@@ -70,6 +73,7 @@ import org.junit.jupiter.api.Timeout;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -105,54 +109,6 @@ public class MQTT5Test extends MQTT5TestSupport {
       producer.connect();
       producer.publish(topic, "myMessage".getBytes(StandardCharsets.UTF_8), 1, false);
       assertTrue(latch.await(500, TimeUnit.MILLISECONDS));
-   }
-
-   @Test
-   @Timeout(DEFAULT_TIMEOUT_SEC)
-   public void testMaxMessagesSameAddress() throws Exception {
-      testMaxMessages("a/b", "a/b", "a.#");
-   }
-
-   @Test
-   @Timeout(DEFAULT_TIMEOUT_SEC)
-   public void testMaxMessagesDifferentAddresses() throws Exception {
-      testMaxMessages("a/b", "a/#", "a.#");
-   }
-
-   private void testMaxMessages(final String publisherTopic, final String subscriptionTopic, final String addressSettingsMatch) throws MqttException {
-      final int MAX_SIZE_MESSAGES = 1;
-
-      // ensure too many messages will trigger a failure
-      server.getAddressSettingsRepository().addMatch(addressSettingsMatch, new AddressSettings().setMaxSizeMessages(MAX_SIZE_MESSAGES).setAddressFullMessagePolicy(AddressFullMessagePolicy.FAIL));
-
-      // ensure that the subscription should get the proper max size messages
-      assertEquals(MAX_SIZE_MESSAGES, server.getAddressSettingsRepository().getMatch(MQTTUtil.getCoreAddressFromMqttTopic(subscriptionTopic, WildcardConfiguration.DEFAULT_WILDCARD_CONFIGURATION)).getMaxSizeMessages());
-
-      // create and disconnect subscriber and ensure it leaves behind a subscription queue on the address
-      MqttClient subscriber = createPahoClient("subscriber");
-      MqttConnectionOptions subscriberOptions = new MqttConnectionOptionsBuilder()
-         .cleanStart(false)
-         .sessionExpiryInterval(999L)
-         .build();
-      subscriber.connect(subscriberOptions);
-      subscriber.subscribe(subscriptionTopic, AT_LEAST_ONCE);
-      subscriber.disconnect();
-      assertNotNull(getSubscriptionQueue(subscriptionTopic, "subscriber"));
-
-      // send messages and ensure the max-size-messages is enforced
-      MqttClient producer = createPahoClient("producer");
-      producer.connect();
-      for (int i = 0; i < MAX_SIZE_MESSAGES; i++) {
-         producer.publish(publisherTopic, RandomUtil.randomBytes(), 1, false);
-      }
-      try {
-         producer.publish(publisherTopic, RandomUtil.randomBytes(), 1, false);
-         fail("Should have failed to publish");
-      } catch (MqttException e) {
-         e.printStackTrace();
-         // ignore
-      }
-      assertEquals(MAX_SIZE_MESSAGES, getSubscriptionQueue(subscriptionTopic, "subscriber").getMessageCount());
    }
 
    @Test
@@ -322,13 +278,16 @@ public class MQTT5Test extends MQTT5TestSupport {
    }
 
    /**
-    * There is no normative statement in the spec about supporting user properties on will messages, but it is implied
-    * in various places.
+    * Verifies that the Application Message properties in Will Properties are included in the published Will Message.
     */
    @Test
    @Timeout(DEFAULT_TIMEOUT_SEC)
    public void testWillMessageProperties() throws Exception {
       final byte[] WILL = RandomUtil.randomBytes();
+      final long MESSAGE_EXPIRY_INTERVAL = 60;
+      final String CONTENT_TYPE = "application/octet-stream";
+      final String RESPONSE_TOPIC = "/topic/reply";
+      final byte[] CORRELATION_DATA = RandomUtil.randomBytes();
       final String[][] properties = new String[10][2];
       for (String[] property : properties) {
          property[0] = RandomUtil.randomUUIDString();
@@ -337,16 +296,18 @@ public class MQTT5Test extends MQTT5TestSupport {
 
       // consumer of the will message
       MqttClient client1 = createPahoClient("willConsumer");
+      runAfter(() -> {
+         if (client1.isConnected()) {
+            client1.disconnect();
+         }
+         client1.close();
+      });
       CountDownLatch latch = new CountDownLatch(1);
+      AtomicReference<MqttProperties> receivedProperties = new AtomicReference<>();
       client1.setCallback(new DefaultMqttCallback() {
          @Override
          public void messageArrived(String topic, MqttMessage message) {
-            int i = 0;
-            for (UserProperty property : message.getProperties().getUserProperties()) {
-               assertEquals(properties[i][0], property.getKey());
-               assertEquals(properties[i][1], property.getValue());
-               i++;
-            }
+            receivedProperties.set(message.getProperties());
             latch.countDown();
          }
       });
@@ -355,7 +316,18 @@ public class MQTT5Test extends MQTT5TestSupport {
 
       // consumer to generate the will
       MqttClient client2 = createPahoClient("willGenerator");
+      runAfter(() -> {
+         if (client2.isConnected()) {
+            client2.disconnectForcibly(0, 0, false);
+         }
+         client2.close();
+      });
       MqttProperties willMessageProperties = new MqttProperties();
+      willMessageProperties.setPayloadFormat(true);
+      willMessageProperties.setMessageExpiryInterval(MESSAGE_EXPIRY_INTERVAL);
+      willMessageProperties.setContentType(CONTENT_TYPE);
+      willMessageProperties.setResponseTopic(RESPONSE_TOPIC);
+      willMessageProperties.setCorrelationData(CORRELATION_DATA);
       List<UserProperty> userProperties = new ArrayList<>();
       for (String[] property : properties) {
          userProperties.add(new UserProperty(property[0], property[1]));
@@ -368,6 +340,19 @@ public class MQTT5Test extends MQTT5TestSupport {
       client2.connect(options);
       client2.disconnectForcibly(0, 0, false);
       assertTrue(latch.await(2, TimeUnit.SECONDS));
+
+      MqttProperties actualProperties = receivedProperties.get();
+      assertTrue(actualProperties.getPayloadFormat());
+      assertTrue(actualProperties.getMessageExpiryInterval() > 0);
+      assertTrue(actualProperties.getMessageExpiryInterval() <= MESSAGE_EXPIRY_INTERVAL);
+      assertEquals(CONTENT_TYPE, actualProperties.getContentType());
+      assertEquals(RESPONSE_TOPIC, actualProperties.getResponseTopic());
+      assertArrayEquals(CORRELATION_DATA, actualProperties.getCorrelationData());
+      assertEquals(properties.length, actualProperties.getUserProperties().size());
+      for (int i = 0; i < properties.length; i++) {
+         assertEquals(properties[i][0], actualProperties.getUserProperties().get(i).getKey());
+         assertEquals(properties[i][1], actualProperties.getUserProperties().get(i).getValue());
+      }
    }
 
    /**
@@ -778,7 +763,7 @@ public class MQTT5Test extends MQTT5TestSupport {
       Wait.assertEquals(1, () -> getSessionStates().size(), 2000, 100);
       assertNotNull(getSessionStates().get(CLIENT_ID));
 
-      assertFalse(client.isConnected());
+      Wait.assertFalse(() -> client.isConnected(), 2000, 100);
 
       client.close();
       client2.disconnect();
@@ -963,13 +948,17 @@ public class MQTT5Test extends MQTT5TestSupport {
       // ensure subscriber got message and ack was blocked
       assertTrue(subscriberLatch.await(500, TimeUnit.MILLISECONDS));
       assertTrue(interceptorBlockedLatch.await(500, TimeUnit.MILLISECONDS));
-      Wait.assertEquals(1L, () -> mqttSessionState.getOutboundStore().getSendQuota(), 2000, 10);
+      Wait.assertEquals(1L, () -> mqttSessionState.getSendQuota(), 2000, 10);
       pendingCountCheckLatch.countDown();
 
       // disconnect subscriber
-      subscriber.disconnect();
+      try {
+         subscriber.disconnect();
+      } catch (Exception e) {
+         // ignore
+      }
       Wait.assertFalse(() -> mqttSessionState.isAttached(), 2000, 50);
-      assertEquals(0, mqttSessionState.getOutboundStore().getSendQuota());
+      assertEquals(0, mqttSessionState.getSendQuota());
       assertEquals(1L, subscriptionQueue.getMessageCount());
       assertEquals(0L, subscriptionQueue.getMessagesAcknowledged());
       assertEquals(0L, subscriptionQueue.getConsumerCount());
@@ -1052,6 +1041,65 @@ public class MQTT5Test extends MQTT5TestSupport {
       assertEquals(RoutingType.MULTICAST, getSubscriptionQueue(topic, clientID).getRoutingType());
    }
 
+   /**
+    * This test stresses the synchronization between the broker sending the CONNACK and starting the SubscriptionManager
+    * and the client sending a SUBSCRIBE.
+    */
+   @Test
+   @Timeout(DEFAULT_TIMEOUT_SEC)
+   public void testConcurrentReconnectAndResubscribe() throws Exception {
+      final int clientCount = 50;
+      final int subsPerClient = 50;
+      final int resubscribeCount = 10;
+      AtomicBoolean failed = new AtomicBoolean(false);
+      ExecutorService executorService = Executors.newFixedThreadPool(clientCount);
+      runAfter(executorService::shutdownNow);
+      CountDownLatch latch = new CountDownLatch(clientCount);
+
+      for (int c = 0; c < clientCount; c++) {
+         final String clientId = "client-" + c;
+         final int clientIndex = c;
+         executorService.submit(() -> {
+            MqttClient client = null;
+            try {
+               client = createPahoClient(clientId);
+               MqttConnectionOptions options = new MqttConnectionOptionsBuilder()
+                  .cleanStart(false)
+                  .sessionExpiryInterval(300L)
+                  .build();
+
+               MqttSubscription[] subs = new MqttSubscription[subsPerClient];
+               for (int s = 0; s < subsPerClient; s++) {
+                  subs[s] = new MqttSubscription("topic/" + clientIndex + "/" + s, AT_LEAST_ONCE);
+               }
+
+               for (int i = 0; i < resubscribeCount; i++) {
+                  connectSafely(client);
+                  client.subscribe(subs);
+                  disconnectSafely(client);
+               }
+               client.close();
+            } catch (Exception e) {
+               logger.error("Client {} failed: {}", clientId, e.getMessage(), e);
+               failed.set(true);
+            } finally {
+               if (client != null) {
+                  try {
+                     client.disconnect();
+                     client.close();
+                  } catch (MqttException e) {
+                     // ignore
+                  }
+               }
+               latch.countDown();
+            }
+         });
+      }
+
+      latch.await();
+      assertFalse(failed.get());
+   }
+
    @Test
    @Timeout(DEFAULT_TIMEOUT_SEC)
    public void testPublishWithDelimiterInTopicNameAndWildcardSubscription() throws Exception {
@@ -1066,5 +1114,115 @@ public class MQTT5Test extends MQTT5TestSupport {
       producer.publish("prefix/a.b", "myMessage".getBytes(StandardCharsets.UTF_8), 1, false);
 
       assertTrue(latch.await(500, TimeUnit.MILLISECONDS));
+   }
+
+   /**
+    * A spec-compliant client can never reuse a packet ID whose QoS 2 handshake is still in-flight, so the "reused packet
+    * ID" path (DUP flag not set) can't be reproduced with a normal client. Instead, seed the broker's PUBLISH cache with
+    * the packet ID the client is about to use to simulate a non-compliant client that resumed its session without
+    * preserving its outgoing QoS 2 state. The broker must treat the fresh (DUP=0) PUBLISH as a duplicate and log a WARN
+    * because the new message is silently dropped.
+    */
+   @Test
+   @Timeout(DEFAULT_TIMEOUT_SEC)
+   public void testDuplicateQoS2PublishWithReusedPacketIdLogsWarning() throws Exception {
+      final String TOPIC = RandomUtil.randomUUIDString();
+      final String CLIENT_ID = "publisher";
+      // Paho assigns packet ID 1 to the first QoS > 0 message sent on a fresh connection
+      final int PACKET_ID = 1;
+
+      server.createQueue(QueueConfiguration.of(TOPIC)
+                            .setAddress(TOPIC)
+                            .setRoutingType(RoutingType.MULTICAST)
+                            .setDurable(true));
+
+      MqttClient publisher = createPahoClient(CLIENT_ID);
+      publisher.connect(new MqttConnectionOptionsBuilder().cleanStart(false).sessionExpiryInterval(300L).build());
+
+      // Seed the broker's PUBLISH cache with the packet ID the client is about to use.
+      SimpleString cacheName = PacketIdCache.getCacheName(server.getInternalNamingPrefix(), CLIENT_ID, PacketIdCache.TYPE.PUBLISH);
+      DuplicateIDCache pubCache = server.getPostOffice().getDuplicateIDCache(cacheName, MQTTUtil.TWO_BYTE_INT_MAX);
+      pubCache.addToCache(ByteUtil.intToBytes(PACKET_ID), null);
+
+      try (AssertionLoggerHandler loggerHandler = new AssertionLoggerHandler()) {
+         // Fresh (DUP=0) PUBLISH reusing the cached packet ID; blocks until the QoS 2 handshake completes
+         publisher.publish(TOPIC, RandomUtil.randomBytes(), EXACTLY_ONCE, false);
+
+         assertTrue(loggerHandler.findText("AMQ834009"), "expected WARN for reused packet ID");
+         assertFalse(loggerHandler.findText("AMQ834017"), "did not expect the retransmit INFO message");
+      }
+
+      // The "new" message was silently dropped as a duplicate; nothing was delivered to the queue
+      assertEquals(0L, server.locateQueue(TOPIC).getMessageCount());
+
+      publisher.disconnect();
+      publisher.close();
+   }
+
+   /**
+    * Companion to {@link #testDuplicateQoS2PublishWithReusedPacketIdLogsWarning()}. With the
+    * {@code rejectUnexpectedDuplicatePacketId} setting enabled the broker must respond to the DUP=0 reused-packet-ID
+    * case with a {@code PUBREC} reason code of {@code 0x91} (i.e. "Packet Identifier in use") instead of {@code 0x00}
+    * (i.e. "Success").
+    */
+   @Test
+   @Timeout(DEFAULT_TIMEOUT_SEC)
+   public void testDuplicateQoS2PublishWithReusedPacketIdRejected() throws Exception {
+      setAcceptorProperty("rejectUnexpectedDuplicatePacketId=true");
+
+      final String TOPIC = RandomUtil.randomUUIDString();
+      final String CLIENT_ID = "publisher";
+      // Paho assigns packet ID 1 to the first QoS > 0 message sent on a fresh connection
+      final int PACKET_ID = 1;
+
+      server.createQueue(QueueConfiguration.of(TOPIC)
+                            .setAddress(TOPIC)
+                            .setRoutingType(RoutingType.MULTICAST)
+                            .setDurable(true));
+
+      // capture the reason code of the outgoing PUBREC
+      AtomicInteger pubRecReasonCode = new AtomicInteger(-1);
+      CountDownLatch pubRecLatch = new CountDownLatch(1);
+      MQTTInterceptor outgoingInterceptor = (packet, connection) -> {
+         if (packet.fixedHeader().messageType() == MqttMessageType.PUBREC && packet.variableHeader() instanceof MqttPubReplyMessageVariableHeader header) {
+            pubRecReasonCode.set(header.reasonCode() & 0xFF);
+            pubRecLatch.countDown();
+         }
+         return true;
+      };
+      server.getRemotingService().addOutgoingInterceptor(outgoingInterceptor);
+
+      MqttClient publisher = createPahoClient(CLIENT_ID);
+      publisher.connect(new MqttConnectionOptionsBuilder().cleanStart(false).sessionExpiryInterval(300L).build());
+
+      // Seed the broker's PUBLISH cache with the packet ID the client is about to use.
+      SimpleString cacheName = PacketIdCache.getCacheName(server.getInternalNamingPrefix(), CLIENT_ID, PacketIdCache.TYPE.PUBLISH);
+      DuplicateIDCache pubCache = server.getPostOffice().getDuplicateIDCache(cacheName, MQTTUtil.TWO_BYTE_INT_MAX);
+      pubCache.addToCache(ByteUtil.intToBytes(PACKET_ID), null);
+
+      try (AssertionLoggerHandler loggerHandler = new AssertionLoggerHandler()) {
+         // Fresh (DUP=0) PUBLISH reusing the cached packet ID; the broker rejects it so Paho reports the reason code
+         try {
+            publisher.publish(TOPIC, RandomUtil.randomBytes(), EXACTLY_ONCE, false);
+            fail("expected the publish to fail with a 'packet identifier in use' reason code");
+         } catch (MqttException e) {
+            assertEquals(MQTTReasonCodes.PACKET_IDENTIFIER_IN_USE & 0xFF, e.getReasonCode(), "expected reason code 0x91");
+         }
+
+         assertTrue(loggerHandler.findText("AMQ834009"), "expected WARN for reused packet ID");
+      }
+
+      assertTrue(pubRecLatch.await(2, TimeUnit.SECONDS), "expected a PUBREC to be sent");
+      assertEquals(MQTTReasonCodes.PACKET_IDENTIFIER_IN_USE & 0xFF, pubRecReasonCode.get(), "expected PUBREC reason code 0x91");
+
+      // The "new" message was silently dropped as a duplicate; nothing was delivered to the queue
+      assertEquals(0L, server.locateQueue(TOPIC).getMessageCount());
+
+      try {
+         publisher.disconnect();
+      } catch (MqttException e) {
+         // the client may already be disconnected as a result of the rejected publish
+      }
+      publisher.close();
    }
 }

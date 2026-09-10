@@ -33,7 +33,9 @@ import java.net.URI;
 import java.net.URISyntaxException;
 import java.net.URL;
 import java.net.http.HttpClient;
+import java.nio.file.FileSystemException;
 import java.nio.file.Files;
+import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
@@ -51,7 +53,6 @@ import java.util.jar.Attributes;
 import java.util.jar.JarEntry;
 import java.util.jar.JarOutputStream;
 import java.util.jar.Manifest;
-import java.util.regex.Pattern;
 
 import io.netty.bootstrap.Bootstrap;
 import io.netty.channel.Channel;
@@ -102,9 +103,9 @@ import org.apache.http.protocol.HttpContext;
 import org.apache.http.ssl.SSLContextBuilder;
 import org.eclipse.jetty.ee9.webapp.WebAppContext;
 import org.eclipse.jetty.ee9.webapp.WebInfConfiguration;
-import org.eclipse.jetty.util.ssl.SslContextFactory;
 import org.eclipse.jetty.util.thread.ThreadPool;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -126,9 +127,18 @@ public class WebServerComponentTest extends ArtemisTestCase {
    static final String URL = System.getProperty("url", "http://localhost:8161/WebServerComponentTest.txt");
    static final String SECURE_URL = System.getProperty("url", "https://localhost:8448/WebServerComponentTest.txt");
 
-   static final String KEY_STORE_PATH = WebServerComponentTest.class.getClassLoader().getResource("server-keystore.p12").getFile();
+   private static String getResourcePath(String resourceName) {
+      try {
+         URI uri = WebServerComponentTest.class.getClassLoader().getResource(resourceName).toURI();
+         return Path.of(uri).toString();
+      } catch (Exception e) {
+         throw new RuntimeException(e);
+      }
+   }
 
-   static final String PEM_KEY_STORE_PATH = WebServerComponentTest.class.getClassLoader().getResource("server-keystore.pemcfg").getFile();
+   static final String KEY_STORE_PATH = getResourcePath("server-keystore.p12");
+
+   static final String PEM_KEY_STORE_PATH = getResourcePath("server-keystore.pemcfg");
 
    static final String KEY_STORE_PASSWORD = "securepass";
 
@@ -352,15 +362,6 @@ public class WebServerComponentTest extends ArtemisTestCase {
 
    private WebServerComponent startSimpleSecureServer(BindingDTO bindingDTO) throws Exception {
       bindingDTO.setUri("https://localhost:0");
-      if (System.getProperty("java.vendor").contains("IBM")) {
-         //By default on IBM Java 8 JVM, org.eclipse.jetty.util.ssl.SslContextFactory doesn't include TLSv1.2
-         // while it excludes all TLSv1 and TLSv1.1 cipher suites.
-         bindingDTO.setIncludedTLSProtocols("TLSv1.2");
-         // Remove excluded cipher suites matching the prefix `SSL` because the names of the IBM Java 8 JVM cipher suites
-         // have the prefix `SSL` while the `DEFAULT_EXCLUDED_CIPHER_SUITES` of org.eclipse.jetty.util.ssl.SslContextFactory
-         // includes "^SSL_.*$". So all IBM JVM cipher suites are excluded by SslContextFactory using the `DEFAULT_EXCLUDED_CIPHER_SUITES`.
-         bindingDTO.setExcludedCipherSuites(Arrays.stream(new SslContextFactory.Server().getExcludeCipherSuites()).filter(s -> !Pattern.matches(s, "SSL_")).toArray(String[]::new));
-      }
       WebServerDTO webServerDTO = new WebServerDTO();
       webServerDTO.setBindings(Collections.singletonList(bindingDTO));
       webServerDTO.path = "webapps";
@@ -392,11 +393,6 @@ public class WebServerComponentTest extends ArtemisTestCase {
       SSLEngine engine = context.createSSLEngine();
       engine.setUseClientMode(true);
       engine.setWantClientAuth(true);
-      if (System.getProperty("java.vendor").contains("IBM")) {
-         //By default on IBM Java 8 JVM, SSLEngine doesn't enable TLSv1.2 while
-         // org.eclipse.jetty.util.ssl.SslContextFactory excludes all TLSv1 and TLSv1.1 cipher suites.
-         engine.setEnabledProtocols(new String[] {"TLSv1.2"});
-      }
       final SslHandler sslHandler = new SslHandler(engine);
 
       CountDownLatch latch = new CountDownLatch(1);
@@ -575,8 +571,16 @@ public class WebServerComponentTest extends ArtemisTestCase {
 
       String keyStorePath;
       if (useSymbolicLinks) {
-         keyStorePath = Files.createSymbolicLink(storeFolder.toPath().resolve(
-             "store-keystore.p12"), keyStoreFile.toPath()).toString();
+         try {
+            keyStorePath = Files.createSymbolicLink(storeFolder.toPath().resolve(
+                "store-keystore.p12"), keyStoreFile.toPath()).toString();
+         } catch (FileSystemException e) {
+            // Check if privileges are missing on Windows
+            if (e.getMessage() != null && e.getMessage().contains("A required privilege is not held by the client")) {
+               Assumptions.assumeTrue(false, "Skipping test: Windows account lacks the privilege to create symbolic links.");
+            }
+            throw e;
+         }
       } else {
          keyStorePath = keyStoreFile.getAbsolutePath();
       }
@@ -649,24 +653,40 @@ public class WebServerComponentTest extends ArtemisTestCase {
       String sourceKey;
       String sourceCert;
       if (useSymbolicLinks) {
-         sourceKey = Files.createSymbolicLink(storeFolder.toPath().resolve(
-             "store-key.pem"), serverKeyFile.toPath()).toString();
-         sourceCert = Files.createSymbolicLink(storeFolder.toPath().resolve(
-             "store-cert.pem"), serverCertFile.toPath()).toString();
+         try {
+            sourceKey = Files.createSymbolicLink(storeFolder.toPath().resolve(
+               "store-key.pem"), serverKeyFile.toPath()).toString();
+            sourceCert = Files.createSymbolicLink(storeFolder.toPath().resolve(
+               "store-cert.pem"), serverCertFile.toPath()).toString();
+         } catch (FileSystemException e) {
+            // Check if privileges are missing on Windows
+            if (e.getMessage() != null && e.getMessage().contains("A required privilege is not held by the client")) {
+               Assumptions.assumeTrue(false, "Skipping test: Windows account lacks the privilege to create symbolic links.");
+            }
+            throw e;
+         }
       } else {
          sourceKey = serverKeyFile.getAbsolutePath();
          sourceCert = serverCertFile.getAbsolutePath();
       }
 
       Files.write(serverPemConfigFile.toPath(), Arrays.asList(new String[]{
-         "source.key=" + sourceKey,
-         "source.cert=" + sourceCert
+         "source.key=" + sourceKey.replace("\\", "/"),
+         "source.cert=" + sourceCert.replace("\\", "/")
       }));
 
       String keyStorePath;
       if (useSymbolicLinks) {
-         keyStorePath = Files.createSymbolicLink(storeFolder.toPath().resolve(
-             "store-pem-config.properties"), serverPemConfigFile.toPath()).toString();
+         try {
+            keyStorePath = Files.createSymbolicLink(storeFolder.toPath().resolve(
+               "store-pem-config.properties"), serverPemConfigFile.toPath()).toString();
+         } catch (FileSystemException e) {
+            // Check if privileges are missing on Windows
+            if (e.getMessage() != null && e.getMessage().contains("A required privilege is not held by the client")) {
+               Assumptions.assumeTrue(false, "Skipping test: Windows account lacks the privilege to create symbolic links.");
+            }
+            throw e;
+         }
       } else {
          keyStorePath = serverPemConfigFile.getAbsolutePath();
       }
@@ -762,20 +782,12 @@ public class WebServerComponentTest extends ArtemisTestCase {
    public void simpleSecureServerWithClientAuth() throws Exception {
       BindingDTO bindingDTO = new BindingDTO();
       bindingDTO.uri = "https://localhost:0";
-      bindingDTO.setKeyStorePath(KEY_STORE_PATH);
+      String keyStorePath = KEY_STORE_PATH.replace("\\", "/");
+      bindingDTO.setKeyStorePath(keyStorePath);
       bindingDTO.setKeyStorePassword(KEY_STORE_PASSWORD);
       bindingDTO.setClientAuth(true);
-      bindingDTO.setTrustStorePath(KEY_STORE_PATH);
+      bindingDTO.setTrustStorePath(keyStorePath);
       bindingDTO.setTrustStorePassword(KEY_STORE_PASSWORD);
-      if (System.getProperty("java.vendor").contains("IBM")) {
-         //By default on IBM Java 8 JVM, org.eclipse.jetty.util.ssl.SslContextFactory doesn't include TLSv1.2
-         // while it excludes all TLSv1 and TLSv1.1 cipher suites.
-         bindingDTO.setIncludedTLSProtocols("TLSv1.2");
-         // Remove excluded cipher suites matching the prefix `SSL` because the names of the IBM Java 8 JVM cipher suites
-         // have the prefix `SSL` while the `DEFAULT_EXCLUDED_CIPHER_SUITES` of org.eclipse.jetty.util.ssl.SslContextFactory
-         // includes "^SSL_.*$". So all IBM JVM cipher suites are excluded by SslContextFactory using the `DEFAULT_EXCLUDED_CIPHER_SUITES`.
-         bindingDTO.setExcludedCipherSuites(Arrays.stream(new SslContextFactory.Server().getExcludeCipherSuites()).filter(s -> !Pattern.matches(s, "SSL_")).toArray(String[]::new));
-      }
       WebServerDTO webServerDTO = new WebServerDTO();
       webServerDTO.setBindings(Collections.singletonList(bindingDTO));
       webServerDTO.path = "webapps";
@@ -799,11 +811,6 @@ public class WebServerComponentTest extends ArtemisTestCase {
       SSLEngine engine = context.createSSLEngine();
       engine.setUseClientMode(true);
       engine.setWantClientAuth(true);
-      if (System.getProperty("java.vendor").contains("IBM")) {
-         //By default on IBM Java 8 JVM, SSLEngine doesn't enable TLSv1.2 while
-         // org.eclipse.jetty.util.ssl.SslContextFactory excludes all TLSv1 and TLSv1.1 cipher suites.
-         engine.setEnabledProtocols(new String[] {"TLSv1.2"});
-      }
       final SslHandler sslHandler = new SslHandler(engine);
 
       CountDownLatch latch = new CountDownLatch(1);

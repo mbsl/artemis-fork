@@ -138,6 +138,9 @@ import org.apache.activemq.artemis.json.JsonObject;
 import org.apache.activemq.artemis.json.JsonObjectBuilder;
 import org.apache.activemq.artemis.json.JsonString;
 import org.apache.activemq.artemis.json.JsonValue;
+import org.snakeyaml.engine.v2.api.Load;
+import org.snakeyaml.engine.v2.api.LoadSettings;
+
 import org.apache.activemq.artemis.utils.ByteUtil;
 import org.apache.activemq.artemis.utils.ClassloadingUtil;
 import org.apache.activemq.artemis.utils.Env;
@@ -173,6 +176,8 @@ public class ConfigurationImpl extends javax.security.auth.login.Configuration i
    public static final JournalType DEFAULT_JOURNAL_TYPE = JournalType.ASYNCIO;
 
    public static final String PROPERTY_CLASS_SUFFIX = ".class";
+
+   public static final String JSON_CLASS_DISCRIMINATOR_KEY = "_class";
 
    public static final String REDACTED = "**redacted**";
 
@@ -399,6 +404,10 @@ public class ConfigurationImpl extends javax.security.auth.login.Configuration i
 
    private long journalLockAcquisitionTimeout = ActiveMQDefaultConfiguration.getDefaultJournalLockAcquisitionTimeout();
 
+   private long journalLockMonitorTimeout = ActiveMQDefaultConfiguration.getDefaultJournalLockMonitorTimeout();
+
+   private int journalLockMonitorMaxRetries = ActiveMQDefaultConfiguration.getDefaultJournalLockMonitorMaxRetries();
+
    private HAPolicyConfiguration haPolicyConfiguration;
 
    private StoreConfiguration storeConfiguration;
@@ -497,7 +506,7 @@ public class ConfigurationImpl extends javax.security.auth.login.Configuration i
    private File artemisInstance;
    private transient JsonObject jsonStatus = JsonLoader.createObjectBuilder().build();
    private final Set<String> keysToRedact = new HashSet<>();
-   private static final Pattern defaultPropertiesFileNamePattern = Pattern.compile(".*\\.(json|properties)");
+   private static final Pattern defaultPropertiesFileNamePattern = Pattern.compile(".*\\.(json|yaml|properties)");
 
    private JsonObject getJsonStatus() {
       if (jsonStatus == null) {
@@ -625,8 +634,11 @@ public class ConfigurationImpl extends javax.security.auth.login.Configuration i
       InsertionOrderedProperties brokerProperties = new InsertionOrderedProperties();
       try (CheckedInputStream checkedInputStream = new CheckedInputStream(new FileInputStream(file), new Adler32())) {
          try {
-            if (file.getName().endsWith(".json")) {
+            String fileName = file.getName();
+            if (fileName.endsWith(".json")) {
                brokerProperties.loadJson(configuration, checkedInputStream);
+            } else if (fileName.endsWith(".yaml")) {
+               brokerProperties.loadYaml(configuration, checkedInputStream);
             } else {
                brokerProperties.load(checkedInputStream);
             }
@@ -675,11 +687,11 @@ public class ConfigurationImpl extends javax.security.auth.login.Configuration i
             beanProperties.put(key, value);
          }
       }
-      long fileAlder32 = 0;
+      long fileAdler32 = 0;
       if (properties instanceof InsertionOrderedProperties insertionOrderedProperties) {
-         fileAlder32 = insertionOrderedProperties.getFileChecksum();
+         fileAdler32 = insertionOrderedProperties.getFileChecksum();
       }
-      updateReadPropertiesStatus(name, checksum.getValue(), fileAlder32);
+      updateReadPropertiesStatus(name, checksum.getValue(), fileAdler32);
 
       if (!beanProperties.isEmpty()) {
          populateWithProperties(target, name, beanProperties);
@@ -1290,10 +1302,16 @@ public class ConfigurationImpl extends javax.security.auth.login.Configuration i
       this.jsonStatus = JsonUtil.mergeAndUpdate(status, jsonObjectBuilder.build());
    }
 
-   private synchronized void updateReadPropertiesStatus(String propsId, long alder32Hash, long fileAlder32) {
+   private synchronized void updateReadPropertiesStatus(String propsId, long adler32Hash, long fileAdler32) {
       JsonObjectBuilder propertiesReadStatusBuilder = JsonLoader.createObjectBuilder();
-      propertiesReadStatusBuilder.add("alder32", String.valueOf(alder32Hash));
-      propertiesReadStatusBuilder.add("fileAlder32", String.valueOf(fileAlder32));
+
+      // keep "alder32" & "fileAlder32" for backwards compatibility
+      propertiesReadStatusBuilder.add("alder32", String.valueOf(adler32Hash));
+      propertiesReadStatusBuilder.add("fileAlder32", String.valueOf(fileAdler32));
+
+      propertiesReadStatusBuilder.add("adler32", String.valueOf(adler32Hash));
+      propertiesReadStatusBuilder.add("fileAdler32", String.valueOf(fileAdler32));
+
       JsonObjectBuilder jsonObjectBuilder = JsonUtil.objectBuilderWithValueAtPath("properties/" + propsId, propertiesReadStatusBuilder.build());
       JsonObject jsonStatus = getJsonStatus();
       this.jsonStatus = JsonUtil.mergeAndUpdate(jsonStatus, jsonObjectBuilder.build());
@@ -3004,7 +3022,7 @@ public class ConfigurationImpl extends javax.security.auth.login.Configuration i
                           scheduledThreadPoolMaxSize, securityEnabled, populateValidatedUser,
                           securityInvalidationInterval, securitySettings, serverDumpInterval, threadPoolMaxSize,
                           transactionTimeout, transactionTimeoutScanPeriod, wildcardConfiguration, resolveProtocols,
-                          journalLockAcquisitionTimeout, connectionTtlCheckInterval);
+                          journalLockAcquisitionTimeout, journalLockMonitorTimeout, journalLockMonitorMaxRetries, connectionTtlCheckInterval);
    }
 
    @Override
@@ -3085,6 +3103,8 @@ public class ConfigurationImpl extends javax.security.auth.login.Configuration i
              Objects.equals(wildcardConfiguration, other.wildcardConfiguration) &&
              resolveProtocols == other.resolveProtocols &&
              journalLockAcquisitionTimeout == other.journalLockAcquisitionTimeout &&
+             journalLockMonitorTimeout == other.journalLockMonitorTimeout &&
+             journalLockMonitorMaxRetries == other.journalLockMonitorMaxRetries &&
              connectionTtlCheckInterval == other.connectionTtlCheckInterval &&
              journalDatasync == other.journalDatasync &&
              Objects.equals(globalMaxSize, other.globalMaxSize) &&
@@ -3124,6 +3144,28 @@ public class ConfigurationImpl extends javax.security.auth.login.Configuration i
    @Override
    public long getJournalLockAcquisitionTimeout() {
       return journalLockAcquisitionTimeout;
+   }
+
+   @Override
+   public ConfigurationImpl setJournalLockMonitorTimeout(long journalLockMonitorTimeout) {
+      this.journalLockMonitorTimeout = journalLockMonitorTimeout;
+      return this;
+   }
+
+   @Override
+   public long getJournalLockMonitorTimeout() {
+      return journalLockMonitorTimeout;
+   }
+
+   @Override
+   public ConfigurationImpl setJournalLockMonitorMaxRetries(int journalLockMonitorMaxRetries) {
+      this.journalLockMonitorMaxRetries = journalLockMonitorMaxRetries;
+      return this;
+   }
+
+   @Override
+   public int getJournalLockMonitorMaxRetries() {
+      return journalLockMonitorMaxRetries;
    }
 
    @Override
@@ -3882,11 +3924,106 @@ public class ConfigurationImpl extends javax.security.auth.login.Configuration i
          return true;
       }
 
+      public synchronized boolean loadYaml(ConfigurationImpl configuration, InputStream inputStream) {
+         LoadSettings settings = LoadSettings.builder()
+            .setMaxAliasesForCollections(50)
+            .setCodePointLimit(3 * 1024 * 1024)
+            .build();
+         Load yamlLoad = new Load(settings);
+         @SuppressWarnings("unchecked")
+         Map<String, Object> yamlMap = (Map<String, Object>) yamlLoad.loadFromInputStream(inputStream);
+         if (yamlMap == null) {
+            return false;
+         }
+         final String surroundString = determineSurroundString(configuration, yamlMap);
+         loadYamlMap(surroundString, "", yamlMap);
+         return true;
+      }
+
+      @SuppressWarnings("unchecked")
+      private void loadYamlMap(String keySurroundString, String parentKey, Map<String, Object> map) {
+         // emit _class discriminator first so the interface-typed field gets instantiated
+         // before any sub-properties attempt to set values on it
+         Object classDiscriminator = map.get(JSON_CLASS_DISCRIMINATOR_KEY);
+         if (classDiscriminator != null) {
+            String discriminatorKey = parentKey.endsWith(".") ? parentKey.substring(0, parentKey.length() - 1) : parentKey;
+            put(discriminatorKey, String.valueOf(classDiscriminator));
+         }
+
+         // process scalar entries before nested maps — scalar setters must complete
+         // before nested property resolution triggers getters that may lazily depend on
+         // sibling scalar values (e.g., uri must be set before transportConfigurations
+         // is accessed, because getTransportConfigurations() lazily calls parseURI())
+         loadYamlEntries(keySurroundString, parentKey, map, false);
+         loadYamlEntries(keySurroundString, parentKey, map, true);
+      }
+
+      @SuppressWarnings("unchecked")
+      private void loadYamlEntries(String keySurroundString, String parentKey, Map<String, Object> map, boolean parseMaps) {
+         for (Map.Entry<String, Object> entry : map.entrySet()) {
+            Object value = entry.getValue();
+            boolean isMap = value instanceof Map;
+            if (isMap != parseMaps) {
+               continue;
+            }
+            String key = entry.getKey();
+            if (JSON_CLASS_DISCRIMINATOR_KEY.equals(key)) {
+               continue;
+            }
+            key = autoSurroundIfNecessary(key, keySurroundString);
+            String propertyKey = parentKey + key;
+            if (isMap) {
+               loadYamlMap(keySurroundString, propertyKey + ".", (Map<String, Object>) value);
+            } else if (value instanceof List<?> list) {
+               put(propertyKey, list.stream()
+                  .map(String::valueOf)
+                  .collect(java.util.stream.Collectors.joining(",")));
+            } else if (value != null) {
+               put(propertyKey, String.valueOf(value));
+            }
+         }
+      }
+
+      private String determineSurroundString(ConfigurationImpl configuration, Map<String, Object> yamlMap) {
+         Object surroundValue = yamlMap.get(ActiveMQDefaultConfiguration.BROKER_PROPERTIES_KEY_SURROUND_PROPERTY);
+         if (surroundValue != null) {
+            return String.valueOf(surroundValue);
+         }
+         Object brokerSurroundValue = yamlMap.get("brokerPropertiesKeySurround");
+         if (brokerSurroundValue != null) {
+            return String.valueOf(brokerSurroundValue);
+         }
+         return configuration.getBrokerPropertiesKeySurround();
+      }
+
       private void loadJsonObject(String keySurroundString, String parentKey, JsonObject jsonObject) {
+         // emit _class discriminator first so the interface-typed field gets instantiated
+         // before any sub-properties attempt to set values on it
+         if (jsonObject.containsKey(JSON_CLASS_DISCRIMINATOR_KEY)) {
+            String discriminatorKey = parentKey.endsWith(".") ? parentKey.substring(0, parentKey.length() - 1) : parentKey;
+            put(discriminatorKey, jsonObject.getString(JSON_CLASS_DISCRIMINATOR_KEY));
+         }
+
+         // process scalar entries before nested objects — scalar setters must complete
+         // before nested property resolution triggers getters that may lazily depend on
+         // sibling scalar values (e.g., uri must be set before transportConfigurations
+         // is accessed, because getTransportConfigurations() lazily calls parseURI())
+         loadJsonEntries(keySurroundString, parentKey, jsonObject, false);
+         loadJsonEntries(keySurroundString, parentKey, jsonObject, true);
+      }
+
+      private void loadJsonEntries(String keySurroundString, String parentKey, JsonObject jsonObject, boolean parseObjects) {
          jsonObject.entrySet().stream().forEach(jsonEntry -> {
+            String jsonKey = jsonEntry.getKey();
+            if (JSON_CLASS_DISCRIMINATOR_KEY.equals(jsonKey)) {
+               return;
+            }
             JsonValue jsonValue = jsonEntry.getValue();
             JsonValue.ValueType jsonValueType = jsonValue.getValueType();
-            String jsonKey = jsonEntry.getKey();
+            boolean isObject = jsonValueType == JsonValue.ValueType.OBJECT;
+            if (isObject != parseObjects) {
+               return;
+            }
             jsonKey = autoSurroundIfNecessary(jsonKey, keySurroundString);
             String propertyKey = parentKey + jsonKey;
             switch (jsonValueType) {
@@ -3900,6 +4037,13 @@ public class ConfigurationImpl extends javax.security.auth.login.Configuration i
                case TRUE:
                case FALSE:
                   put(propertyKey, String.valueOf(jsonValue));
+                  break;
+               case ARRAY:
+                  put(propertyKey, jsonValue.asJsonArray().stream()
+                     .map(v -> v.getValueType() == JsonValue.ValueType.STRING
+                        ? ((JsonString) v).getString()
+                        : String.valueOf(v))
+                     .collect(java.util.stream.Collectors.joining(",")));
                   break;
                default:
                   throw new IllegalStateException("JSON value type not supported: " + jsonValueType);

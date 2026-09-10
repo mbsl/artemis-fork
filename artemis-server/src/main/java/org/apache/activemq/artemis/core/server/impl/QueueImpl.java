@@ -49,6 +49,7 @@ import org.apache.activemq.artemis.api.config.ActiveMQDefaultConfiguration;
 import org.apache.activemq.artemis.api.core.ActiveMQException;
 import org.apache.activemq.artemis.api.core.ActiveMQNullRefException;
 import org.apache.activemq.artemis.api.core.ActiveMQQueueExistsException;
+import org.apache.activemq.artemis.api.core.ActiveMQShutdownException;
 import org.apache.activemq.artemis.api.core.Message;
 import org.apache.activemq.artemis.api.core.Pair;
 import org.apache.activemq.artemis.api.core.QueueConfiguration;
@@ -2077,7 +2078,7 @@ public class QueueImpl extends CriticalComponentImpl implements Queue {
       try {
          Transaction tx = new TransactionImpl(storageManager);
 
-         synchronized (this) {
+         synchronized (QueueImpl.this) {
             // ensure all messages are moved from intermediateMessageReferences so that they can be seen by the iterator
             doInternalPoll();
 
@@ -2223,7 +2224,7 @@ public class QueueImpl extends CriticalComponentImpl implements Queue {
    }
 
    @Override
-   public synchronized boolean deleteReference(final long messageID) throws Exception {
+   public boolean deleteReference(final long messageID) throws Exception {
       return iterQueue("deleteReference", DEFAULT_FLUSH_LIMIT, null, new QueueIterateAction(messageID) {
          @Override
          public boolean actMessage(Transaction tx, MessageReference ref) throws Exception {
@@ -3895,6 +3896,11 @@ public class QueueImpl extends CriticalComponentImpl implements Queue {
    }
 
    private boolean checkExpired(final MessageReference reference) {
+      if (isMirrorController()) {
+         // we don't expire through the MirrorSNF
+         return false;
+      }
+
       try {
          if (reference.getMessage().isExpired()) {
             logger.trace("Reference {} is expired", reference);
@@ -4016,6 +4022,8 @@ public class QueueImpl extends CriticalComponentImpl implements Queue {
                // There is a startup check to remove non referenced messages case these deletes fail
                try {
                   storageManager.deleteMessage(message.getMessageID());
+               } catch (ActiveMQShutdownException e) {
+                  ActiveMQServerLogger.LOGGER.unableToDeleteMessageDuringShutdown(message.getMessageID());
                } catch (Exception e) {
                   ActiveMQServerLogger.LOGGER.cannotFindMessageOnJournal(message.getMessageID(), e);
                }

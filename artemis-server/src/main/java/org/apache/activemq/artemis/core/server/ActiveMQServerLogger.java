@@ -323,6 +323,9 @@ public interface ActiveMQServerLogger {
    @LogMessage(id = 221086, value = "Cannot route {}", level = LogMessage.Level.INFO)
    void cannotRouteClientConnection(Connection connection);
 
+   @LogMessage(id = 221087, value = "Configuration reload completed", level = LogMessage.Level.INFO)
+   void configurationReloadCompleted();
+
    @LogMessage(id = 222000, value = "ActiveMQServer is being finalized and has not been stopped. Please remember to stop the server before letting it go out of scope", level = LogMessage.Level.WARN)
    void serverFinalisedWIthoutBeingSTopped();
 
@@ -879,8 +882,8 @@ public interface ActiveMQServerLogger {
    @LogMessage(id = 222229, value = "Failed to perform rollback", level = LogMessage.Level.WARN)
    void failedToPerformRollback(IllegalStateException e);
 
-   @LogMessage(id = 222230, value = "Failed to send notification", level = LogMessage.Level.WARN)
-   void failedToSendNotification(Exception e);
+   @LogMessage(id = 222230, value = "Failed to send notification: {}; Exception message: {}", level = LogMessage.Level.WARN)
+   void failedToSendNotification(String notification, String exceptionMessage);
 
    @LogMessage(id = 222231, value = "Failed to flush outstanding data from the connection", level = LogMessage.Level.WARN)
    void failedToFlushOutstandingDataFromTheConnection(Throwable e);
@@ -1399,7 +1402,7 @@ public interface ActiveMQServerLogger {
    @LogMessage(id = 224115, value = "Address control unblock of address '{}'. Clients will be granted credit as normal.", level = LogMessage.Level.INFO)
    void unblockingViaControl(SimpleString addressName);
 
-   @LogMessage(id = 224116, value = "The component {} is not responsive during start up. The Server may be taking too long to start", level = LogMessage.Level.WARN)
+   @LogMessage(id = 224116, value = "The component {} is not responsive. The Server may be taking too long to activate", level = LogMessage.Level.WARN)
    void tooLongToStart(Object component);
 
    @LogMessage(id = 224117, value = "\"page-max-cache-size\" being used on broker.xml. This configuration attribute is no longer used and it will be ignored.", level = LogMessage.Level.INFO)
@@ -1522,7 +1525,7 @@ public interface ActiveMQServerLogger {
    void lockCoordinatorNotFoundOnAcceptor(String lockName, String acceptorName);
 
    @LogMessage(id = 224156, value = "LockCoordinator {} starting with className={} and lockID={} with checkPeriod={} milliseconds", level = LogMessage.Level.INFO)
-   void lockCoordinatorStarting(String lockName, String className, String lockID, int checkPeriod);
+   void lockCoordinatorStarting(String lockName, String className, String lockID, long checkPeriod);
 
    @LogMessage(id = 224157, value = "At least one of the components failed to start under the lockCoordinator {}. A retry will be executed", level = LogMessage.Level.INFO)
    void retryLockCoordinator(String name);
@@ -1547,4 +1550,13 @@ public interface ActiveMQServerLogger {
 
    @LogMessage(id = 224164, value = "Failed to recover stored configuration for divert named '{}': {}. To repair this record create a new divert with the same name via the management API.", level = LogMessage.Level.WARN)
    void failedToRecoverStoredDivertConfiguration(String divertName, String divert);
+
+   @LogMessage(id = 224170, value = "Server is stopping. Unable to process redelivery during rollback; ref: {}; transaction: {}; exception message: {}", level = LogMessage.Level.WARN)
+   void unableToProcessRedeliveryDuringRollback(String messageRef, String transaction, String exceptionMessage);
+
+   @LogMessage(id = 224171, value = "Server is stopping. Unable to delete unreferenced message with id={}.", level = LogMessage.Level.WARN)
+   void unableToDeleteMessageDuringShutdown(long messageId);
+
+   @LogMessage(id = 224172, value = "Failed to remove binding {} from address {} during wildcard address cleanup", level = LogMessage.Level.WARN)
+   void failedToRemoveBindingDuringWildcardCleanup(String binding, String address, Exception e);
 }
